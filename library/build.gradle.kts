@@ -18,9 +18,15 @@ kotlin {
             jvmTarget.set(JvmTarget.JVM_1_8)
         }
     }
-    iosX64()
-    iosArm64()
-    iosSimulatorArm64()
+    iosX64() {
+        compilations["main"].cinterops.create("sqlite3")
+    }
+    iosArm64() {
+        compilations["main"].cinterops.create("sqlite3")
+    }
+    iosSimulatorArm64() {
+        compilations["main"].cinterops.create("sqlite3")
+    }
 
     sourceSets {
         val commonMain by getting {
@@ -46,7 +52,7 @@ android {
 }
 
 mavenPublishing {
-    coordinates("com.latenighthack.ktstore", "ktstore-library", "0.0.1")
+    coordinates("com.latenighthack.ktstore", "ktstore-library", "0.0.2")
 
     pom {
         name.set("ktstore")
