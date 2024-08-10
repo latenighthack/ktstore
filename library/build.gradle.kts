@@ -52,7 +52,7 @@ android {
 }
 
 mavenPublishing {
-    coordinates("com.latenighthack.ktstore", "ktstore-library", "0.0.2")
+    coordinates("com.latenighthack.ktstore", "ktstore-library", "0.0.3")
 
     pom {
         name.set("ktstore")
