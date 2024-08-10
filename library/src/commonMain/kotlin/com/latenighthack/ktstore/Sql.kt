@@ -46,10 +46,6 @@ class SqlStoreDelegate(private val driver: SqlDriver) : StoreDelegate {
     }
 
     override suspend fun registerStore(tableName: String, keys: List<StoreKey<*>>, primaryKey: StoreKey<*>?) {
-        val statement = SqlHelper.generateCreateCommand(tableName, keys, primaryKey)
-
-        driver.createTable(statement)
-
         stores.add(TableDescriptor(tableName, keys, primaryKey))
     }
 
