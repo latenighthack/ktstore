@@ -157,8 +157,9 @@ public open class Store<ValueType>(
 
     protected fun <IndexType> serializedIndex(
         accessor: KProperty1<ValueType, IndexType?>,
-        writer: KFunction1<IndexType, ByteArray>
-    ) = Index.SerializedIndex<ValueType>(accessor.name) {
+        writer: KFunction1<IndexType, ByteArray>,
+        overrideName: String? = null
+    ) = Index.SerializedIndex<ValueType>(overrideName ?: (accessor.name + writer.name)) {
         val value = accessor(this)!!
 
         writer(value)
@@ -166,14 +167,16 @@ public open class Store<ValueType>(
 
     protected fun <IndexType> bytesIndex(
         accessor: KProperty1<ValueType, ByteArray>,
-    ) = Index.SerializedIndex<ValueType>(accessor.name) {
+        overrideName: String? = null
+    ) = Index.SerializedIndex<ValueType>(overrideName ?: (accessor.name + writer.name)) {
         accessor(this)
     }.also { indices.add(it) }
 
     protected fun <IndexType> longIndex(
         accessor: KProperty1<ValueType, IndexType?>,
-        writer: KFunction1<IndexType, Long>
-    ) = Index.LongIndex<ValueType>(accessor.name) {
+        writer: KFunction1<IndexType, Long>,
+        overrideName: String? = null
+    ) = Index.LongIndex<ValueType>(overrideName ?: (accessor.name + writer.name)) {
         val value = accessor(this)!!
         writer(value)
     }.also { indices.add(it) }
