@@ -165,19 +165,61 @@ public open class Store<ValueType>(
         writer(value)
     }.also { indices.add(it) }
 
-    protected fun <IndexType> bytesIndex(
+    protected fun bytesIndex(
         accessor: KProperty1<ValueType, ByteArray>,
         overrideName: String? = null
     ) = Index.SerializedIndex<ValueType>(overrideName ?: (accessor.name + writer.name)) {
         accessor(this)
     }.also { indices.add(it) }
 
-    protected fun <IndexType> longIndex(
+    protected fun longIndex(
+        accessor: KProperty1<ValueType, Long?>,
+        overrideName: String? = null
+    ) = Index.LongIndex<ValueType>(overrideName ?: (accessor.name + writer.name)) {
+        accessor(this) ?: 0L
+    }.also { indices.add(it) }
+
+    protected fun booleanIndex(
+        accessor: KProperty1<ValueType, Boolean?>,
+        overrideName: String? = null
+    ) = Index.BooleanIndex<ValueType>(overrideName ?: (accessor.name + writer.name)) {
+        accessor(this) ?: false
+    }.also { indices.add(it) }
+
+    protected fun stringIndex(
+        accessor: KProperty1<ValueType, String?>,
+        overrideName: String? = null
+    ) = Index.StringIndex<ValueType>(overrideName ?: (accessor.name + writer.name)) {
+        accessor(this) ?: ""
+    }.also { indices.add(it) }
+
+    protected fun <IndexType> longMappedIndex(
         accessor: KProperty1<ValueType, IndexType?>,
         writer: KFunction1<IndexType, Long>,
         overrideName: String? = null
     ) = Index.LongIndex<ValueType>(overrideName ?: (accessor.name + writer.name)) {
         val value = accessor(this)!!
+
+        writer(value)
+    }.also { indices.add(it) }
+
+    protected fun <IndexType> booleanMappedIndex(
+        accessor: KProperty1<ValueType, IndexType?>,
+        writer: KFunction1<IndexType, Boolean>,
+        overrideName: String? = null
+    ) = Index.BooleanIndex<ValueType>(overrideName ?: (accessor.name + writer.name)) {
+        val value = accessor(this)!!
+
+        writer(value)
+    }.also { indices.add(it) }
+
+    protected fun <IndexType> stringMappedIndex(
+        accessor: KProperty1<ValueType, IndexType?>,
+        writer: KFunction1<IndexType, String>,
+        overrideName: String? = null
+    ) = Index.StringIndex<ValueType>(overrideName ?: (accessor.name + writer.name)) {
+        val value = accessor(this)!!
+
         writer(value)
     }.also { indices.add(it) }
 
