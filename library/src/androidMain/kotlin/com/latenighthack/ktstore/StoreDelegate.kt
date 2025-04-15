@@ -98,7 +98,7 @@ class SqliteStoreDelegate(
             put(VALUE_COLUMN_NAME, data as ByteArray)
             keys.forEach {
                 when (it) {
-                    is BoundStoreKey.SerializedKey -> put(it.name, SqlHelper.toBlobLiteral(it.value))
+                    is BoundStoreKey.SerializedKey -> put(it.name, SqlHelper.toBlobLiteral(it.value, blobType = "BLOB"))
                     is BoundStoreKey.StringKey -> put(it.name, it.value)
                     is BoundStoreKey.BooleanKey -> put(it.name, it.value)
                     is BoundStoreKey.IntegerKey -> put(it.name, it.value)

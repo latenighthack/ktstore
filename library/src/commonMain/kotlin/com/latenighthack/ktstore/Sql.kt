@@ -1,5 +1,11 @@
 package com.latenighthack.ktstore
 
+private val <T> StoreKey<T>.columnName: String
+    get() = when (this) {
+        is StoreKey.CompositeKey -> names.joinToString(", ")
+        else -> name
+    }
+
 interface SqlDriver {
     suspend fun createTable(statement: String)
     suspend fun dropTable(tableName: String)
@@ -21,7 +27,7 @@ interface SqlSelect : SqlBoundQuery {
     suspend fun getBytes(column: Int): ByteArray
 }
 
-class SqlStoreDelegate(private val driver: SqlDriver) : StoreDelegate {
+class SqlStoreDelegate(private val driver: SqlDriver, private val blobType: String) : StoreDelegate {
     private val stores = mutableListOf<TableDescriptor>()
     override val isSerialized: Boolean
         get() = true
@@ -34,7 +40,7 @@ class SqlStoreDelegate(private val driver: SqlDriver) : StoreDelegate {
 
     override suspend fun createStores() {
         for (store in stores) {
-            val statement = SqlHelper.generateCreateCommand(store.tableName, store.keys, store.primaryKey)
+            val statement = SqlHelper.generateCreateCommand(store.tableName, store.keys, store.primaryKey, blobType = blobType)
             driver.createTable(statement)
         }
     }
@@ -53,13 +59,25 @@ class SqlStoreDelegate(private val driver: SqlDriver) : StoreDelegate {
         val nonCompositeKeys = keys.filter { it !is BoundStoreKey.CompositeKey }
         val insertKeys = listOf("__value", *(nonCompositeKeys.map { it.name }).toTypedArray())
             .joinToString(", ")
-        val insertValues = listOf(SqlHelper.toBlobLiteral(data as ByteArray))
+        val insertValues = listOf(SqlHelper.toBlobLiteral(data as ByteArray, blobType))
             .plus(nonCompositeKeys.map {
-                SqlHelper.convertKey(it)
+                SqlHelper.convertKey(it, blobType)
             })
             .joinToString(", ")
+        val table = stores.first { it.tableName == tableName }
+        val primaryKeyName = table.primaryKey!!.columnName
+        val excludedKeys = listOf(
+            "__value",
+            *(nonCompositeKeys.filter { it.name != primaryKeyName }.map { it.name }).toTypedArray()
+        ).joinToString(", ") { "$it = EXCLUDED.$it" }
 
-        val insertStatement = "REPLACE INTO $tableName ($insertKeys) VALUES ($insertValues);"
+        val insertStatement = if (blobType == "BYTEA") {
+            "INSERT INTO $tableName ($insertKeys) VALUES ($insertValues) ON CONFLICT ($primaryKeyName) DO UPDATE SET $excludedKeys;"
+
+        } else {
+            "REPLACE INTO $tableName ($insertKeys) VALUES ($insertValues);"
+        }
+
         val insert = driver.execute(insertStatement)
 
         try {
@@ -88,7 +106,7 @@ class SqlStoreDelegate(private val driver: SqlDriver) : StoreDelegate {
                 val mappedClauses = it.where.split("?")
                     .mapIndexed { index, subclause ->
                         if (index < clause.args.size) {
-                            subclause + SqlHelper.convertKey(clause.args[index])
+                            subclause + SqlHelper.convertKey(clause.args[index], blobType)
                         } else {
                             ""
                         }

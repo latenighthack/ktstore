@@ -146,7 +146,7 @@ class IndexDB(private val databaseName: String) : StoreDelegate {
         return when (boundStoreKey) {
             is BoundStoreKey.SerializedKey -> boundStoreKey.value
             is BoundStoreKey.StringKey -> boundStoreKey.value
-            is BoundStoreKey.BooleanKey -> boundStoreKey.value
+            is BoundStoreKey.BooleanKey -> if (boundStoreKey.value) 1 else 0
             is BoundStoreKey.IntegerKey -> boundStoreKey.value
             is BoundStoreKey.LongKey -> boundStoreKey.value.toString()
             is BoundStoreKey.CompositeKey -> boundStoreKey.values.map { getValue(it) }.toTypedArray()
@@ -169,7 +169,12 @@ class IndexDB(private val databaseName: String) : StoreDelegate {
             val index = objectStore.index(indexName)
             val eqValue = getValue(key)
 
-            index.getAll(window.asDynamic().IDBKeyRange.only(eqValue))
+            try {
+                index.getAll(window.asDynamic().IDBKeyRange.only(eqValue))
+            } catch (error: dynamic) {
+                println("error: name=${indexName}, index=${index}")
+                throw error
+            }
         } else {
             objectStore.getAll()
         }

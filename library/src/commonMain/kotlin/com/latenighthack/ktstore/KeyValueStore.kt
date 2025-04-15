@@ -3,14 +3,44 @@ package com.latenighthack.ktstore
 import com.latenighthack.ktstore.binary.fromHexString
 import com.latenighthack.ktstore.binary.toHexString
 
-public expect class KeyValueStoreDelegate {
-    fun getItem(key: String): String?
+public interface KeyValueStoreDelegate {
+    suspend fun getItem(key: String): String?
 
-    fun saveItem(key: String, value: String)
+    suspend fun saveItem(key: String, value: String)
 
-    fun deleteItem(key: String)
+    suspend fun deleteItem(key: String)
 
-    fun deleteAll()
+    suspend fun deleteAll()
+}
+
+public class InMemoryKeyValueStoreDelegate: KeyValueStoreDelegate {
+    private val store = mutableMapOf<String, String>()
+
+    override suspend fun getItem(key: String): String? {
+        return store[key]
+    }
+
+    override suspend fun saveItem(key: String, value: String) {
+        store[key] = value
+    }
+
+    override suspend fun deleteItem(key: String) {
+        store.remove(key)
+    }
+
+    override suspend fun deleteAll() {
+        store.clear()
+    }
+}
+
+public expect class PersistentKeyValueStoreDelegate(storeName: String): KeyValueStoreDelegate {
+    override suspend fun getItem(key: String): String?
+
+    override suspend fun saveItem(key: String, value: String)
+
+    override suspend fun deleteItem(key: String)
+
+    override suspend fun deleteAll()
 }
 
 public class KeyValueStore(private val delegate: KeyValueStoreDelegate) {

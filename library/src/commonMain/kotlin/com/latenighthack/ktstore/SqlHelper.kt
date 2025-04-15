@@ -6,11 +6,15 @@ object SqlHelper {
     private const val VALUE_COLUMN_NAME = "__value"
     private val hexCharLookup = "0123456789ABCDEF".toCharArray()
 
-    fun toBlobLiteral(blob: ByteArray): String {
+    fun toBlobLiteral(blob: ByteArray, blobType: String = "BLOB"): String {
         val builder = StringBuilder()
 
-        builder.append('X')
-        builder.append('\'')
+        if (blobType == "BYTEA") {
+            builder.append("'\\x")
+        } else {
+            builder.append('X')
+            builder.append('\'')
+        }
 
         for (byte in blob) {
             val highNybble = (byte.toInt() and 0xf0) shr 4
@@ -21,6 +25,10 @@ object SqlHelper {
         }
         builder.append('\'')
 
+        if (blobType == "BYTEA") {
+            builder.append("::bytea")
+        }
+
         return builder.toString()
     }
 
@@ -28,12 +36,12 @@ object SqlHelper {
         return "DROP TABLE $tableName;"
     }
 
-    fun generateCreateCommand(tableName: String, keys: List<StoreKey<*>>, primaryKey: StoreKey<*>?): String {
+    fun generateCreateCommand(tableName: String, keys: List<StoreKey<*>>, primaryKey: StoreKey<*>?, blobType: String = "BLOB"): String {
         val columns = listOf(
-            "$VALUE_COLUMN_NAME BLOB NOT NULL"
+            "$VALUE_COLUMN_NAME $blobType NOT NULL"
         ) + keys.mapNotNull { key ->
             val type = when (key) {
-                is StoreKey.SerializedKey -> "BLOB"
+                is StoreKey.SerializedKey -> blobType
                 is StoreKey.StringKey -> "TEXT"
                 is StoreKey.BooleanKey -> "INTEGER"
                 is StoreKey.IntegerKey -> "INTEGER"
@@ -69,9 +77,9 @@ object SqlHelper {
         return commands.joinToString("\n")
     }
 
-    fun convertKey(key: BoundStoreKey): String {
+    fun convertKey(key: BoundStoreKey, blobType: String = "BYTES"): String {
         return when (key) {
-            is BoundStoreKey.SerializedKey -> toBlobLiteral(key.value)
+            is BoundStoreKey.SerializedKey -> toBlobLiteral(key.value, blobType)
             is BoundStoreKey.StringKey -> "'${key.value.replace("'", "\\'")}'"
             is BoundStoreKey.BooleanKey -> if (key.value) "1" else "0"
             is BoundStoreKey.IntegerKey -> "${key.value}"

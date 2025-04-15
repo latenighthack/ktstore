@@ -122,10 +122,20 @@ public open class Store<ValueType>(
             override fun eq(other: String) = StoreRelation.Eq(BoundStoreKey.StringKey(name, other))
         }
 
-        class CompositeIndex<ValueType>(name: String, val names: List<String>) : Index<ValueType, List<BoundStoreKey>>(
+        class CompositeIndex<ValueType>(
+            name: String,
+            val names: List<String>,
+            compositeIndices: Array<out Index<ValueType, *>>
+        ) : Index<ValueType, List<BoundStoreKey>>(
             name,
             StoreKey.CompositeKey(name, names),
-            { listOf() }
+            {
+                val value = this
+
+                compositeIndices.map {
+                    it.key.bind(it.accessor(value)!!)
+                }
+            }
         ) {
             override fun eq(other: List<BoundStoreKey>) =
                 StoreRelation.Eq(BoundStoreKey.CompositeKey(name, names, other))
@@ -151,7 +161,7 @@ public open class Store<ValueType>(
         val names = compositeIndices.map { it.name }
         val name = "composite_" + names.joinToString("_")
 
-        return Index.CompositeIndex<ValueType>(name, names)
+        return Index.CompositeIndex<ValueType>(name, names, compositeIndices)
             .also { indices.add(it) }
     }
 
@@ -168,28 +178,28 @@ public open class Store<ValueType>(
     protected fun bytesIndex(
         accessor: KProperty1<ValueType, ByteArray>,
         overrideName: String? = null
-    ) = Index.SerializedIndex<ValueType>(overrideName ?: (accessor.name + writer.name)) {
+    ) = Index.SerializedIndex<ValueType>(overrideName ?: (accessor.name)) {
         accessor(this)
     }.also { indices.add(it) }
 
     protected fun longIndex(
         accessor: KProperty1<ValueType, Long?>,
         overrideName: String? = null
-    ) = Index.LongIndex<ValueType>(overrideName ?: (accessor.name + writer.name)) {
+    ) = Index.LongIndex<ValueType>(overrideName ?: (accessor.name)) {
         accessor(this) ?: 0L
     }.also { indices.add(it) }
 
     protected fun booleanIndex(
         accessor: KProperty1<ValueType, Boolean?>,
         overrideName: String? = null
-    ) = Index.BooleanIndex<ValueType>(overrideName ?: (accessor.name + writer.name)) {
+    ) = Index.BooleanIndex<ValueType>(overrideName ?: (accessor.name)) {
         accessor(this) ?: false
     }.also { indices.add(it) }
 
     protected fun stringIndex(
         accessor: KProperty1<ValueType, String?>,
         overrideName: String? = null
-    ) = Index.StringIndex<ValueType>(overrideName ?: (accessor.name + writer.name)) {
+    ) = Index.StringIndex<ValueType>(overrideName ?: (accessor.name)) {
         accessor(this) ?: ""
     }.also { indices.add(it) }
 

@@ -18,13 +18,15 @@ kotlin {
             jvmTarget.set(JvmTarget.JVM_1_8)
         }
     }
-    iosX64() {
+    jvm {
+    }
+    iosX64 {
         compilations["main"].cinterops.create("sqlite3")
     }
-    iosArm64() {
+    iosArm64 {
         compilations["main"].cinterops.create("sqlite3")
     }
-    iosSimulatorArm64() {
+    iosSimulatorArm64 {
         compilations["main"].cinterops.create("sqlite3")
     }
 
@@ -38,6 +40,11 @@ kotlin {
         val commonTest by getting {
             dependencies {
                 implementation(libs.kotlin.test)
+            }
+        }
+        val jvmMain by getting {
+            dependencies {
+                implementation(libs.postgresql)
             }
         }
     }
