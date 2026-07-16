@@ -12,7 +12,7 @@ private fun BoundStoreKey.toAny(): Any? {
         is BoundStoreKey.LongKey -> key.value
         is BoundStoreKey.CompositeKey -> {
             key.values.mapIndexed { index, value ->
-                Pair(key.names[index], value)
+                Pair(key.names[index], value.toAny())
             }.toMap()
         }
     }
@@ -49,22 +49,24 @@ fun ByteArray.toComparable(): ComparableByteArray {
 }
 
 public class InMemoryStoreDelegate : StoreDelegate {
-    private data class StoreDescriptor(
+    data class StoreDescriptor(
         val tableName: String,
         val keys: List<StoreKey<*>>,
         val primaryKey: StoreKey<*>?
     )
 
-    private data class ActiveStore(
-        val values: MutableMap<Any, DataRow>,
+    data class ActiveStore(
+        val values: MutableMap<Any, DataRow<*>>,
         val mutex: Mutex = Mutex()
     )
 
-    private data class DataRow(val data: Any, val values: MutableMap<Any, Any>)
+    data class DataRow<T>(val data: T, val values: MutableMap<Any, Any>)
 
     private val registeredStores = mutableMapOf<String, StoreDescriptor>()
     private val activeStores = mutableMapOf<String, StoreDescriptor>()
     private val activeStoreData = mutableMapOf<String, ActiveStore>()
+
+    val storeData: Map<String, ActiveStore> = activeStoreData
 
     override suspend fun registerStore(tableName: String, keys: List<StoreKey<*>>, primaryKey: StoreKey<*>?) {
         registeredStores[tableName] = StoreDescriptor(tableName, keys, primaryKey)
@@ -80,7 +82,7 @@ public class InMemoryStoreDelegate : StoreDelegate {
         activeStoreData.clear()
     }
 
-    private suspend fun <T> modifyTable(tableName: String, callback: (MutableMap<Any, DataRow>) -> T): T {
+    private suspend fun <T> modifyTable(tableName: String, callback: (MutableMap<Any, DataRow<*>>) -> T): T {
         val store = activeStoreData[tableName]!!
 
         return store.mutex.withLock {
@@ -114,7 +116,7 @@ public class InMemoryStoreDelegate : StoreDelegate {
 
     override suspend fun getAll(tableName: String, relation: StoreRelation?): List<Any> {
         return modifyTable(tableName) {
-            it.filterValues(relation.toPredicate()).values.map { it.data }
+            it.filterValues(relation.toPredicate()).values.map { it.data as Any }
         }
     }
 
@@ -136,7 +138,7 @@ public class InMemoryStoreDelegate : StoreDelegate {
 
     override val isSerialized: Boolean = false
 
-    private fun StoreRelation?.toPredicate(): ((DataRow) -> Boolean) {
+    private fun StoreRelation?.toPredicate(): ((DataRow<*>) -> Boolean) {
         val relation = this ?: return { true }
 
         return { row ->
