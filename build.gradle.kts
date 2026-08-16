@@ -14,7 +14,7 @@ plugins {
 
 allprojects {
     group = "com.latenighthack.ktstore"
-    version = "0.0.7"
+    version = "0.0.8"
 
     repositories {
         mavenCentral()
@@ -29,7 +29,11 @@ subprojects {
         configure<MavenPublishBaseExtension> {
             configureBasedOnAppliedPlugins(true, true)
             publishToMavenCentral(SonatypeHost.CENTRAL_PORTAL, automaticRelease = true)
-            signAllPublications()
+            // Sign only when a key is configured (CI release); a local publishToMavenLocal has no
+            // signatory and must not fail on the signing task.
+            if (providers.gradleProperty("signingInMemoryKey").isPresent) {
+                signAllPublications()
+            }
             pom {
                 name.set(project.name)
                 description.set("Native storage wrappers for Kotlin Multiplatform.")
