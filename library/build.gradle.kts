@@ -35,6 +35,12 @@ kotlin {
     iosSimulatorArm64 {
         compilations["main"].cinterops.create("sqlite3")
     }
+    macosX64 {
+        compilations["main"].cinterops.create("sqlite3")
+    }
+    macosArm64 {
+        compilations["main"].cinterops.create("sqlite3")
+    }
 
     sourceSets {
         val commonMain by getting {

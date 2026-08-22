@@ -12,7 +12,7 @@ concurrency:
 jobs:
   publish:
     name: Publish to Maven Central
-    # macOS is required: the iOS Kotlin/Native targets can only be compiled with Xcode.
+    # macOS is required: the iOS and macOS Kotlin/Native targets can only be compiled with Xcode.
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
