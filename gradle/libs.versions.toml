@@ -5,9 +5,11 @@ kotlinx = "1.9.0"
 android-minSdk = "24"
 android-compileSdk = "34"
 postgresql = "42.3.1"
+hikari = "5.1.0"
 
 [libraries]
 postgresql = { module = "org.postgresql:postgresql", version.ref = "postgresql" }
+hikari = { module = "com.zaxxer:HikariCP", version.ref = "hikari" }
 kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinx" }
 kotlinx-coroutines-jvm = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-jdk8", version.ref = "kotlinx" }

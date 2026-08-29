@@ -122,13 +122,16 @@ class SqlStoreDelegate(private val driver: SqlDriver, private val blobType: Stri
         val select = driver.selectAll("SELECT __value, * FROM $tableName$whereClause;")
         val rows = mutableListOf<ByteArray>()
 
-        while (select.step()) {
-            val value = select.getBytes(0)
+        try {
+            while (select.step()) {
+                val value = select.getBytes(0)
 
-            rows.add(value)
+                rows.add(value)
+            }
+        } finally {
+            // Always release the borrowed connection, even if step()/getBytes() throws mid-iteration.
+            select.finalize()
         }
-
-        select.finalize()
 
         return rows
     }
