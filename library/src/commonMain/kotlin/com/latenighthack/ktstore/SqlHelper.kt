@@ -54,12 +54,12 @@ object SqlHelper {
         val standardIndices = keys
             .filter { it !is StoreKey.CompositeKey }
             .map {
-                "CREATE INDEX IF NOT EXISTS idx_${it.name} ON $tableName (${it.name});"
+                "CREATE INDEX IF NOT EXISTS idx_${tableName}_${it.name} ON $tableName (${it.name});"
             }
         val compositeIndices = keys
             .filterIsInstance<StoreKey.CompositeKey>()
             .map {
-                "CREATE INDEX IF NOT EXISTS idx_${it.name} ON $tableName (${it.names.joinToString(", ")});"
+                "CREATE INDEX IF NOT EXISTS idx_${tableName}_${it.name} ON $tableName (${it.names.joinToString(", ")});"
             }
         val primaryKeyStatement = primaryKey?.let {
             val primaryKeys = if (it is StoreKey.CompositeKey) {

@@ -1,5 +1,9 @@
 package com.latenighthack.ktstore
 
+import kotlinx.coroutines.withContext
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -48,7 +52,31 @@ fun ByteArray.toComparable(): ComparableByteArray {
     return ComparableByteArray(this)
 }
 
-public class InMemoryStoreDelegate : StoreDelegate {
+public class InMemoryStoreDelegate : TransactionalStoreDelegate {
+    private val transactionMutex = Mutex()
+    private class Transaction(val owner: InMemoryStoreDelegate) : AbstractCoroutineContextElement(Key) {
+        companion object Key : CoroutineContext.Key<Transaction>
+    }
+    override suspend fun <T> transaction(block: suspend () -> T): T {
+        if (coroutineContext[Transaction]?.owner === this) return block()
+        return transactionMutex.withLock {
+            val snapshot = activeStoreData.mapValues { (_, store) -> store.values.toMap() }
+            try { withContext(Transaction(this)) { block() } }
+            catch (error: Throwable) {
+                snapshot.forEach { (name, rows) -> activeStoreData.getValue(name).values.apply { clear(); putAll(rows) } }
+                throw error
+            }
+        }
+    }
+
+    override suspend fun <T> transaction(lockKey: String, block: suspend () -> T): T = transaction(block)
+    override suspend fun saveAll(tableName: String, rows: List<StoreRow>) = transaction {
+        rows.forEach { save(tableName, it.data, it.keys) }
+    }
+    override suspend fun deleteMany(tableName: String, relations: List<StoreRelation>) = transaction {
+        relations.forEach { delete(tableName, it) }
+    }
+
     data class StoreDescriptor(
         val tableName: String,
         val keys: List<StoreKey<*>>,
@@ -85,9 +113,8 @@ public class InMemoryStoreDelegate : StoreDelegate {
     private suspend fun <T> modifyTable(tableName: String, callback: (MutableMap<Any, DataRow<*>>) -> T): T {
         val store = activeStoreData[tableName]!!
 
-        return store.mutex.withLock {
-            callback(store.values)
-        }
+        return if (coroutineContext[Transaction]?.owner === this) callback(store.values)
+        else transactionMutex.withLock { callback(store.values) }
     }
 
     override suspend fun save(tableName: String, data: Any, keys: List<BoundStoreKey>) {

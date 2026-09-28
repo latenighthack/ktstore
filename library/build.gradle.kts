@@ -54,6 +54,7 @@ kotlin {
                 implementation(libs.kotlin.test)
             }
         }
+        val jvmTest by getting { dependencies { implementation("org.xerial:sqlite-jdbc:3.45.3.0") } }
         val jvmMain by getting {
             dependencies {
                 implementation(libs.postgresql)

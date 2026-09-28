@@ -13,12 +13,12 @@ open class NativeSqlBoundQuery constructor(val preparedStatement: CPointer<sqlit
 
     companion object {
         @OptIn(ExperimentalForeignApi::class)
-        private val SQLITE_TRANSIENT = staticCFunction { _: COpaquePointer? -> }
+        private val SQLITE_TRANSIENT = (-1L).toCPointer<CFunction<(COpaquePointer?) -> Unit>>()
     }
 
     override suspend fun bindBytes(column: Int, value: ByteArray) {
         withContext(Dispatchers.Main) {
-            val result = value.usePinned { pinned ->
+            val result = if (value.isEmpty()) sqlite3_bind_zeroblob(preparedStatement, column + 1, 0) else value.usePinned { pinned ->
                 sqlite3_bind_blob(preparedStatement, column + 1, pinned.addressOf(0), value.size.toInt(), SQLITE_TRANSIENT)
             }
             if (result != SQLITE_OK) {
@@ -56,7 +56,11 @@ open class NativeSqlBoundQuery constructor(val preparedStatement: CPointer<sqlit
     override suspend fun step(): Boolean {
         return withContext(Dispatchers.Main) {
             val result = sqlite3_step(preparedStatement)
-            result != SQLITE_DONE
+            when (result) {
+                SQLITE_DONE -> false
+                SQLITE_ROW -> true
+                else -> error("SQLite step failed: $result")
+            }
         }
     }
 }
@@ -65,8 +69,8 @@ open class NativeSqlBoundQuery constructor(val preparedStatement: CPointer<sqlit
 class NativeSqlSelect(statement: CPointer<sqlite3_stmt>) : NativeSqlBoundQuery(statement), SqlSelect {
     override suspend fun getBytes(column: Int): ByteArray {
         return withContext(Dispatchers.Main) {
-            val size = sqlite3_column_bytes(this@NativeSqlSelect.preparedStatement, column + 1)
-            val pointer = sqlite3_column_blob(preparedStatement, column + 1)
+            val size = sqlite3_column_bytes(this@NativeSqlSelect.preparedStatement, column)
+            val pointer = sqlite3_column_blob(preparedStatement, column)
 
             pointer?.readBytes(size.toInt()) ?: ByteArray(0)
         }

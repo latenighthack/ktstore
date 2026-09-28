@@ -40,7 +40,31 @@ public sealed class StoreRelation(val key: BoundStoreKey) {
 
 public expect fun createStoreDelegate(db: String): StoreDelegate
 
+data class StoreRow(val data: Any, val keys: List<BoundStoreKey>)
+
+/**
+ * All stores using this delegate participate in the coroutine-scoped transaction.
+ * Execute operations sequentially inside a transaction; never retain it across network calls.
+ * Nested blocks share the outer transaction (they are not independent savepoints).
+ */
+interface TransactionalStoreDelegate : StoreDelegate {
+    val supportsTransactions: Boolean get() = true
+    suspend fun <T> transaction(block: suspend () -> T): T
+    /** Serializes transactions sharing a logical key across server processes. */
+    suspend fun <T> transaction(lockKey: String, block: suspend () -> T): T
+}
+
 public interface StoreDelegate {
+    suspend fun getMany(tableName: String, relations: List<StoreRelation>): List<Any> =
+        relations.flatMap { getAll(tableName, it) }
+
+    suspend fun saveAll(tableName: String, rows: List<StoreRow>) {
+        rows.forEach { save(tableName, it.data, it.keys) }
+    }
+    suspend fun deleteMany(tableName: String, relations: List<StoreRelation>) {
+        relations.forEach { delete(tableName, it) }
+    }
+
     suspend fun registerStore(tableName: String, keys: List<StoreKey<*>>, primaryKey: StoreKey<*>?)
 
     suspend fun createStores()
@@ -246,6 +270,11 @@ public open class Store<ValueType>(
         }
     }
 
+    protected suspend fun getMany(relations: List<StoreRelation>): List<ValueType> =
+        delegate.getMany(tableName, relations).map {
+            if (delegate.isSerialized) reader(it as ByteArray) else { @Suppress("UNCHECKED_CAST") (it as ValueType) }
+        }
+
     protected suspend fun get(query: StoreRelation? = null): ValueType? {
         val data = delegate.get(tableName, query)
 
@@ -266,6 +295,15 @@ public open class Store<ValueType>(
     protected suspend fun deleteAll() {
         delegate.deleteAll(tableName)
     }
+
+    protected suspend fun saveAll(values: List<ValueType>) {
+        delegate.saveAll(tableName, values.map { value ->
+            StoreRow(if (delegate.isSerialized) writer(value) else value as Any,
+                indices.map { it.key.bind(it.accessor(value)!!) })
+        })
+    }
+
+    protected suspend fun deleteMany(relations: List<StoreRelation>) = delegate.deleteMany(tableName, relations)
 
     protected suspend fun save(value: ValueType) {
         val data = if (delegate.isSerialized) {
