@@ -36,7 +36,10 @@ object SqlHelper {
         return "DROP TABLE $tableName;"
     }
 
-    fun generateCreateCommand(tableName: String, keys: List<StoreKey<*>>, primaryKey: StoreKey<*>?, blobType: String = "BLOB"): String {
+    fun generateCreateCommand(tableName: String, keys: List<StoreKey<*>>, primaryKey: StoreKey<*>?, blobType: String = "BLOB"): String =
+        generateCreateCommands(tableName, keys, primaryKey, blobType).joinToString("\n")
+
+    fun generateCreateCommands(tableName: String, keys: List<StoreKey<*>>, primaryKey: StoreKey<*>?, blobType: String = "BLOB"): List<String> {
         val columns = listOf(
             "$VALUE_COLUMN_NAME $blobType NOT NULL"
         ) + keys.mapNotNull { key ->
@@ -49,7 +52,7 @@ object SqlHelper {
                 is StoreKey.CompositeKey -> null
             }
 
-            type?.let { "${key.name} $it NOT NULL" }
+            type?.let { "${key.name} $it" + if (key.nullable) "" else " NOT NULL" }
         }
         val standardIndices = keys
             .filter { it !is StoreKey.CompositeKey }
@@ -74,11 +77,12 @@ object SqlHelper {
         val commands =
             listOf("CREATE TABLE IF NOT EXISTS $tableName (${columns.joinToString(", ")}${primaryKeyStatement});") + standardIndices + compositeIndices
 
-        return commands.joinToString("\n")
+        return commands
     }
 
     fun convertKey(key: BoundStoreKey, blobType: String = "BYTES"): String {
         return when (key) {
+            is BoundStoreKey.NullKey -> "NULL"
             is BoundStoreKey.SerializedKey -> toBlobLiteral(key.value, blobType)
             is BoundStoreKey.StringKey -> "'${key.value.replace("'", "\\'")}'"
             is BoundStoreKey.BooleanKey -> if (key.value) "1" else "0"
@@ -97,6 +101,7 @@ object SqlHelper {
         }
 
         val key = relation.key
+        if (key is BoundStoreKey.NullKey || (key is BoundStoreKey.CompositeKey && key.values.any { it is BoundStoreKey.NullKey })) throw StoreFailure.InvalidUsage("Null equality is unsupported for sparse indexes")
         if (key is BoundStoreKey.CompositeKey) {
             selection = key.values
                 .map {

@@ -11,6 +11,7 @@ import kotlin.coroutines.AbstractCoroutineContextElement
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.ensureActive
 
 // Each BoundQuery/Select borrows one pooled connection for its whole lifetime (bind -> step -> finalize)
 // and MUST return it in finalize(). SqlStoreDelegate always calls finalize() in a finally, so the
@@ -19,6 +20,7 @@ open class BoundQuery(private val connection: Connection, val stmt: PreparedStat
     private var executed = false
     protected var resultSet: ResultSet? = null
 
+    override suspend fun bindNull(column: Int) { stmt.setNull(column + 1, java.sql.Types.NULL) }
     override suspend fun bindText(column: Int, value: String) {
         stmt.setString(column+1, value)
     }
@@ -55,8 +57,10 @@ open class BoundQuery(private val connection: Connection, val stmt: PreparedStat
 }
 
 class Select(connection: Connection, stmt: PreparedStatement, closeConnection: Boolean = true) : SqlSelect, BoundQuery(connection, stmt, closeConnection) {
+    override suspend fun getLong(column: Int): Long = resultSet!!.getLong(column + 1)
+    override suspend fun getText(column: Int): String = resultSet!!.getString(column + 1)
     override suspend fun getBytes(column: Int): ByteArray {
-        return resultSet!!.getBytes(column+1)
+        return resultSet!!.getBytes(column+1) ?: throw StoreFailure.CorruptRecord()
     }
 }
 
@@ -64,18 +68,25 @@ class Select(connection: Connection, stmt: PreparedStatement, closeConnection: B
 // and never closed statements/result sets) with a HikariCP pool: connections are validated, capped,
 // recycled on maxLifetime, and every borrowed connection is returned in finalize()/use{}. This fixes
 // both the statement/ResultSet leak and the "single connection dies -> permanent DB outage" failure.
-class JdbcDriver(db: String, private val driver: String) : TransactionalSqlDriver {
+class JdbcDriver(private val db: String, private val driver: String) : ManagedSqlDriver {
     private class Transaction(val owner: JdbcDriver, val connection: Connection) : AbstractCoroutineContextElement(Key) {
+        var rollbackCause: Throwable? = null
         companion object Key : CoroutineContext.Key<Transaction>
     }
 
     override suspend fun <T> transaction(block: suspend () -> T): T {
-        if (coroutineContext[Transaction]?.owner === this) return block()
+        val current = coroutineContext[Transaction]?.takeIf { it.owner === this }
+        if (current != null) {
+            try { return block() } catch (error: Throwable) { current.rollbackCause = error; throw error }
+        }
         return withContext(Dispatchers.IO) {
             dataSource.connection.use { connection ->
                 connection.autoCommit = false
                 try {
-                    val result = withContext(Transaction(this@JdbcDriver, connection)) { block() }
+                    val transaction = Transaction(this@JdbcDriver, connection)
+                    val result = withContext(transaction) { block() }
+                    transaction.rollbackCause?.let { throw StoreFailure.Aborted(it) }
+                    kotlinx.coroutines.currentCoroutineContext().ensureActive()
                     connection.commit()
                     result
                 } catch (error: Throwable) {
@@ -107,6 +118,7 @@ class JdbcDriver(db: String, private val driver: String) : TransactionalSqlDrive
 
     private val dataSource: HikariDataSource = HikariDataSource(HikariConfig().apply {
         jdbcUrl = "jdbc:$driver:$db"
+        if (driver == "sqlite") { addDataSourceProperty("transaction_mode", "IMMEDIATE"); addDataSourceProperty("busy_timeout", "5000") }
         poolName = "ktstore-$driver"
         maximumPoolSize = intProp("ktstore.pool.maxSize", 10)
         minimumIdle = intProp("ktstore.pool.minIdle", 1)
@@ -116,17 +128,28 @@ class JdbcDriver(db: String, private val driver: String) : TransactionalSqlDrive
         leakDetectionThreshold = longProp("ktstore.pool.leakDetectionMs", 0) // off unless opted in
     })
 
-    override suspend fun createTable(statement: String): Unit = withContext(Dispatchers.IO) {
-        dataSource.connection.use { conn ->
-            conn.createStatement().use { it.execute(statement) }
+    override suspend fun close() {
+        if (coroutineContext[Transaction]?.owner === this) throw StoreFailure.InvalidUsage("Cannot close inside transaction")
+        withContext(NonCancellable + Dispatchers.IO) { dataSource.close() }
+    }
+
+    override suspend fun deleteDatabase() {
+        if (driver != "sqlite") throw StoreFailure.InvalidUsage("Database deletion is only supported for owned SQLite files")
+        close()
+        withContext(Dispatchers.IO) {
+            for (suffix in listOf("", "-wal", "-shm", "-journal")) {
+                val file = java.io.File(db + suffix)
+                if (file.exists() && !file.delete()) throw StoreFailure.Unavailable()
+            }
         }
     }
 
-    override suspend fun dropTable(tableName: String): Unit = withContext(Dispatchers.IO) {
-        dataSource.connection.use { conn ->
-            conn.prepareStatement("DROP TABLE ${tableName}").use { it.execute() }
-        }
+    override suspend fun createTable(statement: String) {
+        val query = execute(statement)
+        try { check(!query.step()) } finally { query.finalize() }
     }
+
+    override suspend fun dropTable(tableName: String) = createTable("DROP TABLE $tableName")
 
     override suspend fun selectAll(statement: String): SqlSelect = withContext(Dispatchers.IO) {
         val transaction = coroutineContext[Transaction]?.takeIf { it.owner === this@JdbcDriver }

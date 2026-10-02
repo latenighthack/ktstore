@@ -5,3 +5,7 @@ local.properties
 /kotlin-js-store
 build
 .gradle
+
+# Isolated Fullhouse paired-build state
+.fh/
+.artifacts/

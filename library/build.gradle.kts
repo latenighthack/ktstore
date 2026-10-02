@@ -15,7 +15,7 @@ base { archivesName.set("ktstore-library") }
 
 kotlin {
     js {
-        browser()
+        browser { testTask { useKarma { useChromeHeadless() } } }
     }
     androidTarget {
         publishLibraryVariants("release")
@@ -52,9 +52,18 @@ kotlin {
         val commonTest by getting {
             dependencies {
                 implementation(libs.kotlin.test)
+                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
             }
         }
-        val jvmTest by getting { dependencies { implementation("org.xerial:sqlite-jdbc:3.45.3.0") } }
+        val androidInstrumentedTest by getting {
+            kotlin.srcDir("src/commonTest/kotlin")
+            dependencies {
+                implementation(kotlin("test-junit"))
+                implementation("androidx.test:runner:1.5.2")
+                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
+            }
+        }
+        val jvmTest by getting { dependencies { implementation("org.xerial:sqlite-jdbc:3.45.3.0"); implementation("org.jetbrains.kotlin:kotlin-compiler-embeddable:2.3.10") } }
         val jvmMain by getting {
             dependencies {
                 implementation(libs.postgresql)
@@ -68,6 +77,7 @@ android {
     namespace = "com.latenighthack.ktstore"
     compileSdk = libs.versions.android.compileSdk.get().toInt()
     defaultConfig {
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         minSdk = libs.versions.android.minSdk.get().toInt()
     }
 }

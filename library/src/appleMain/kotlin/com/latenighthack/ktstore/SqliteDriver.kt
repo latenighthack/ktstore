@@ -1,150 +1,143 @@
 package com.latenighthack.ktstore
 
 import kotlinx.cinterop.*
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import sqlite3.*
 import cnames.structs.sqlite3
 import cnames.structs.sqlite3_stmt
-import kotlinx.coroutines.withContext
 import platform.Foundation.*
+import kotlin.coroutines.*
 
-@OptIn(ExperimentalForeignApi::class)
-open class NativeSqlBoundQuery constructor(val preparedStatement: CPointer<sqlite3_stmt>) : SqlBoundQuery {
-
-    companion object {
-        @OptIn(ExperimentalForeignApi::class)
-        private val SQLITE_TRANSIENT = (-1L).toCPointer<CFunction<(COpaquePointer?) -> Unit>>()
+/** Absolute paths are app-owned. Relative paths retain the legacy Documents convention. */
+@OptIn(ExperimentalForeignApi::class, DelicateCoroutinesApi::class, ExperimentalCoroutinesApi::class)
+class SqliteDriver(path: String, private val busyTimeoutMillis: Int = 5_000) : ManagedSqlDriver {
+    private val filename = if (path.startsWith("/")) path else
+        "${NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, true).first() as String}/$path"
+    private val dispatcher = newSingleThreadContext("ktstore-sqlite")
+    private val mutex = Mutex()
+    private var db: CPointer<sqlite3>? = null
+    private val closedFlag = AtomicBoolean(false)
+    private var closed: Boolean
+        get() = closedFlag.value
+        set(value) { closedFlag.value = value }
+    private val statements = mutableSetOf<Query>()
+    private class Tx(val owner: SqliteDriver) : AbstractCoroutineContextElement(Key) {
+        companion object Key : CoroutineContext.Key<Tx>
+        var failure: Throwable? = null
     }
-
-    override suspend fun bindBytes(column: Int, value: ByteArray) {
-        withContext(Dispatchers.Main) {
-            val result = if (value.isEmpty()) sqlite3_bind_zeroblob(preparedStatement, column + 1, 0) else value.usePinned { pinned ->
-                sqlite3_bind_blob(preparedStatement, column + 1, pinned.addressOf(0), value.size.toInt(), SQLITE_TRANSIENT)
-            }
-            if (result != SQLITE_OK) {
-                throw IllegalStateException("Can't bind blob")
+    private class NativeError(val code: Int) : IllegalStateException("SQLite error code $code")
+    private fun checkCode(code: Int) {
+        when (code) {
+            SQLITE_OK, SQLITE_DONE, SQLITE_ROW -> Unit
+            SQLITE_BUSY, SQLITE_LOCKED -> throw StoreFailure.Busy(NativeError(code))
+            SQLITE_CONSTRAINT -> throw StoreFailure.Constraint(NativeError(code))
+            SQLITE_FULL -> throw StoreFailure.Quota(NativeError(code))
+            SQLITE_CORRUPT, SQLITE_NOTADB -> throw StoreFailure.CorruptRecord(NativeError(code))
+            else -> throw StoreFailure.Unavailable(NativeError(code))
+        }
+    }
+    private fun connection(): CPointer<sqlite3> {
+        if (closed) throw StoreFailure.Closed()
+        db?.let { return it }
+        return memScoped {
+            val pointer = alloc<CPointerVar<sqlite3>>()
+            val code = sqlite3_open(filename, pointer.ptr)
+            if (code != SQLITE_OK) { pointer.value?.let { sqlite3_close(it) }; checkCode(code) }
+            pointer.value!!.also { checkCode(sqlite3_busy_timeout(it, busyTimeoutMillis)); db = it }
+        }
+    }
+    private suspend fun <T> access(block: () -> T): T {
+        if (closed) throw StoreFailure.Closed()
+        return withContext(dispatcher) {
+            if (coroutineContext[Tx]?.owner === this@SqliteDriver) block() else mutex.withLock { block() }
+        }
+    }
+    private fun executeNow(sql: String) { checkCode(sqlite3_exec(connection(), sql, null, null, null)) }
+    override suspend fun <T> transaction(block: suspend () -> T): T {
+        val current = coroutineContext[Tx]?.takeIf { it.owner === this }
+        if (current != null) {
+            try { return block() } catch (error: Throwable) { current.failure = error; throw error }
+        }
+        if (closed) throw StoreFailure.Closed()
+        return withContext(dispatcher) {
+            mutex.withLock {
+                executeNow("BEGIN IMMEDIATE")
+                val tx = Tx(this@SqliteDriver)
+                try {
+                    val result = withContext(tx) { block() }
+                    tx.failure?.let { throw StoreFailure.Aborted(it) }
+                    currentCoroutineContext().ensureActive()
+                    executeNow("COMMIT")
+                    result
+                } catch (error: Throwable) {
+                    withContext(NonCancellable) { runCatching { executeNow("ROLLBACK") }.exceptionOrNull()?.let { error.addSuppressed(it) } }
+                    throw error
+                }
             }
         }
     }
-
-    override suspend fun bindInt(column: Int, value: Long) {
-        withContext(Dispatchers.Main) {
-            if (sqlite3_bind_int64(preparedStatement, column + 1, value) != SQLITE_OK) {
-                throw IllegalStateException("Can't bind int")
-            }
-        }
-    }
-
-    override suspend fun bindText(column: Int, value: String) {
-        withContext(Dispatchers.Main) {
-            val result = sqlite3_bind_text(preparedStatement, column + 1, value, -1, SQLITE_TRANSIENT)
-            if (result != SQLITE_OK) {
-                throw IllegalStateException("Can't bind text")
-            }
-        }
-    }
-
-    override suspend fun finalize() {
-        withContext(Dispatchers.Main) {
-            if (sqlite3_finalize(preparedStatement) != SQLITE_OK) {
-                throw IllegalStateException("Failed to finalize statement")
-            }
-        }
-    }
-
-    @OptIn(ExperimentalForeignApi::class)
-    override suspend fun step(): Boolean {
-        return withContext(Dispatchers.Main) {
-            val result = sqlite3_step(preparedStatement)
-            when (result) {
-                SQLITE_DONE -> false
-                SQLITE_ROW -> true
-                else -> error("SQLite step failed: $result")
-            }
-        }
-    }
-}
-
-@OptIn(ExperimentalForeignApi::class)
-class NativeSqlSelect(statement: CPointer<sqlite3_stmt>) : NativeSqlBoundQuery(statement), SqlSelect {
-    override suspend fun getBytes(column: Int): ByteArray {
-        return withContext(Dispatchers.Main) {
-            val size = sqlite3_column_bytes(this@NativeSqlSelect.preparedStatement, column)
-            val pointer = sqlite3_column_blob(preparedStatement, column)
-
-            pointer?.readBytes(size.toInt()) ?: ByteArray(0)
-        }
-    }
-}
-
-@OptIn(ExperimentalForeignApi::class)
-class SqliteDriver(path: String) : SqlDriver {
-
-    private lateinit var db: CPointer<sqlite3>
-
-    init {
+    override suspend fun <T> transaction(lockKey: String, block: suspend () -> T): T = transaction(block)
+    override suspend fun createTable(statement: String) = access { executeNow(statement) }
+    override suspend fun dropTable(tableName: String) = createTable("DROP TABLE $tableName")
+    private suspend fun prepare(sql: String): Query = access {
         memScoped {
-            val dbPtr = alloc<CPointerVar<sqlite3>>()
-            val directory = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, true).first() as String
-
-            val newUrl = NSString.stringWithString("$directory/$path")
-
-            if (sqlite3_open(filename = newUrl, ppDb = dbPtr.ptr) != SQLITE_OK) {
-                throw IllegalStateException("Database not opened")
+            val pointer = alloc<CPointerVar<sqlite3_stmt>>()
+            val result = sqlite3_prepare_v2(connection(), sql, -1, pointer.ptr, null)
+            if (result != SQLITE_OK) { pointer.value?.let { sqlite3_finalize(it) }; checkCode(result) }
+            Query(pointer.value ?: throw StoreFailure.Unavailable()).also { statements.add(it) }
+        }
+    }
+    override suspend fun execute(statement: String): SqlBoundQuery = prepare(statement)
+    override suspend fun selectAll(statement: String): SqlSelect = prepare(statement)
+    private inner class Query(private val statement: CPointer<sqlite3_stmt>) : SqlSelect {
+        private var finalized = false
+        private fun live() { if (finalized) throw StoreFailure.Closed() }
+        override suspend fun bindNull(column: Int) = access { live(); checkCode(sqlite3_bind_null(statement, column + 1)) }
+        override suspend fun bindText(column: Int, value: String) = access {
+            live(); checkCode(sqlite3_bind_text(statement, column + 1, value, -1, (-1L).toCPointer<CFunction<(COpaquePointer?) -> Unit>>()))
+        }
+        override suspend fun bindInt(column: Int, value: Long) = access { live(); checkCode(sqlite3_bind_int64(statement, column + 1, value)) }
+        override suspend fun bindBytes(column: Int, value: ByteArray) = access {
+            live()
+            val result = if (value.isEmpty()) sqlite3_bind_zeroblob(statement, column + 1, 0) else value.usePinned {
+                sqlite3_bind_blob(statement, column + 1, it.addressOf(0), value.size, (-1L).toCPointer<CFunction<(COpaquePointer?) -> Unit>>())
             }
-
-            db = dbPtr.value!!
+            checkCode(result)
+        }
+        override suspend fun step(): Boolean = access { live(); val result = sqlite3_step(statement); checkCode(result); result == SQLITE_ROW }
+        override suspend fun getBytes(column: Int): ByteArray = access {
+            live(); if (sqlite3_column_type(statement, column) == SQLITE_NULL) throw StoreFailure.CorruptRecord()
+            sqlite3_column_blob(statement, column)?.readBytes(sqlite3_column_bytes(statement, column)) ?: ByteArray(0)
+        }
+        override suspend fun getLong(column: Int): Long = access { live(); sqlite3_column_int64(statement, column) }
+        override suspend fun getText(column: Int): String = access { live(); sqlite3_column_text(statement, column)?.reinterpret<ByteVar>()?.toKString() ?: throw StoreFailure.CorruptRecord() }
+        fun finalizeNow() { if (!finalized) { finalized = true; sqlite3_finalize(statement); statements.remove(this) } }
+        override suspend fun finalize() {
+            if (finalized) return
+            withContext(NonCancellable + dispatcher) { finalizeNow() }
         }
     }
-
-    override suspend fun createTable(statement: String) {
-        withContext(Dispatchers.Main) {
-            val createTableStatement = prepareStatement(statement)
-            if (sqlite3_step(createTableStatement) != SQLITE_DONE) {
-                sqlite3_finalize(createTableStatement)
-                throw IllegalStateException("Table not created")
+    override suspend fun close() {
+        if (coroutineContext[Tx]?.owner === this) throw StoreFailure.InvalidUsage("Cannot close inside transaction")
+        if (closed) return
+        withContext(NonCancellable + dispatcher) {
+            mutex.withLock {
+                statements.toList().forEach { it.finalizeNow() }
+                db?.let { checkCode(sqlite3_close(it)) }
+                db = null; closed = true
             }
-            sqlite3_finalize(createTableStatement)
         }
+        dispatcher.close()
     }
-
-    override suspend fun dropTable(tableName: String) {
-        withContext(Dispatchers.Main) {
-            val statement = "DROP TABLE $tableName;"
-            val dropTableStatement = prepareStatement(statement)
-            if (sqlite3_step(dropTableStatement) != SQLITE_DONE) {
-                val errorMessage = "Failed to drop table $tableName"
-                sqlite3_finalize(dropTableStatement)
-                throw IllegalStateException(errorMessage)
+    override suspend fun deleteDatabase() {
+        close()
+        withContext(Dispatchers.Default) {
+            for (suffix in listOf("", "-wal", "-shm", "-journal")) {
+                val path = filename + suffix
+                if (NSFileManager.defaultManager.fileExistsAtPath(path) && !NSFileManager.defaultManager.removeItemAtPath(path, null)) throw StoreFailure.Unavailable()
             }
-            sqlite3_finalize(dropTableStatement)
         }
-    }
-
-    override suspend fun execute(statement: String): SqlBoundQuery {
-        return withContext(Dispatchers.Main) {
-            val preparedStatement = prepareStatement(statement)
-            NativeSqlBoundQuery(preparedStatement)
-        }
-    }
-
-    override suspend fun selectAll(statement: String): SqlSelect {
-        return withContext(Dispatchers.Main) {
-            val preparedStatement = prepareStatement(statement)
-            NativeSqlSelect(preparedStatement)
-        }
-    }
-
-    private fun prepareStatement(statement: String): CPointer<sqlite3_stmt> {
-        val preparedStatement = nativeHeap.alloc<CPointerVar<sqlite3_stmt>>()
-        if (sqlite3_prepare_v2(db, statement, -1, preparedStatement.ptr, null) != SQLITE_OK) {
-            val errorMessage = "Database returned error ${sqlite3_errcode(db)}: ${sqlite3_errmsg(db)?.toKString()}"
-            throw IllegalStateException(errorMessage)
-        }
-        return preparedStatement.value ?: throw IllegalStateException("Statement preparation failed")
-    }
-
-    protected fun finalize() {
-        sqlite3_close(db)
     }
 }

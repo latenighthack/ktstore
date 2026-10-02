@@ -15,3 +15,8 @@ dependencyResolutionManagement {
 
 rootProject.name = "ktstore"
 include(":library")
+
+// Explicit isolated library development; release builds use published dependencies.
+apply(from = "gradle/fh-workspace.settings.gradle")
+
+include(":browser-tests")

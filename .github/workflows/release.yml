@@ -10,7 +10,10 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  conformance:
+    uses: ./.github/workflows/conformance.yml
   publish:
+    needs: conformance
     name: Publish to Maven Central
     # macOS is required: the iOS and macOS Kotlin/Native targets can only be compiled with Xcode.
     runs-on: macos-14

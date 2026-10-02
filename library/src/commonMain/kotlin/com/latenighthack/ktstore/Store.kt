@@ -1,19 +1,23 @@
 package com.latenighthack.ktstore
 
 import com.latenighthack.ktstore.collection.LazyMapList
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlin.reflect.KFunction1
 import kotlin.reflect.KProperty1
 
-public sealed class StoreKey<T>(val name: String) {
-    class SerializedKey(name: String) : StoreKey<ByteArray>(name)
-    class StringKey(name: String) : StoreKey<String>(name)
-    class BooleanKey(name: String) : StoreKey<Boolean>(name)
-    class IntegerKey(name: String) : StoreKey<Int>(name)
-    class LongKey(name: String) : StoreKey<Long>(name)
+public sealed class StoreKey<T>(val name: String, val nullable: Boolean = false) {
+    class SerializedKey(name: String, nullable: Boolean = false) : StoreKey<ByteArray>(name, nullable)
+    class StringKey(name: String, nullable: Boolean = false) : StoreKey<String>(name, nullable)
+    class BooleanKey(name: String, nullable: Boolean = false) : StoreKey<Boolean>(name, nullable)
+    class IntegerKey(name: String, nullable: Boolean = false) : StoreKey<Int>(name, nullable)
+    class LongKey(name: String, nullable: Boolean = false) : StoreKey<Long>(name, nullable)
     class CompositeKey(name: String, val names: List<String>) : StoreKey<List<BoundStoreKey>>(name)
 
     @Suppress("UNCHECKED_CAST")
-    fun bind(any: Any): BoundStoreKey {
+    fun bind(any: Any?): BoundStoreKey {
+        if (any == null) { require(nullable); return BoundStoreKey.NullKey(name) }
         return when (this) {
             is SerializedKey -> BoundStoreKey.SerializedKey(name, any as ByteArray)
             is StringKey -> BoundStoreKey.StringKey(name, any as String)
@@ -26,6 +30,7 @@ public sealed class StoreKey<T>(val name: String) {
 }
 
 public sealed class BoundStoreKey(val name: String) {
+    class NullKey(name: String) : BoundStoreKey(name)
     class SerializedKey(name: String, val value: ByteArray) : BoundStoreKey(name)
     class StringKey(name: String, val value: String) : BoundStoreKey(name)
     class BooleanKey(name: String, val value: Boolean) : BoundStoreKey(name)
@@ -34,8 +39,15 @@ public sealed class BoundStoreKey(val name: String) {
     class CompositeKey(name: String, val names: List<String>, val values: List<BoundStoreKey>) : BoundStoreKey(name)
 }
 
-public sealed class StoreRelation(val key: BoundStoreKey) {
-    class Eq(key: BoundStoreKey) : StoreRelation(key)
+public sealed class StoreRelation(private val binding: () -> BoundStoreKey) {
+    val key: BoundStoreKey get() = binding().also {
+        if (it is BoundStoreKey.NullKey || (it is BoundStoreKey.CompositeKey && it.values.any { key -> key is BoundStoreKey.NullKey }))
+            throw StoreFailure.InvalidUsage("Null equality is unsupported for sparse indexes")
+    }
+    class Eq private constructor(binding: () -> BoundStoreKey, unused: Unit) : StoreRelation(binding) {
+        constructor(key: BoundStoreKey) : this({ key }, Unit)
+        internal constructor(binding: () -> BoundStoreKey) : this(binding, Unit)
+    }
 }
 
 public expect fun createStoreDelegate(db: String): StoreDelegate
@@ -69,6 +81,7 @@ public interface StoreDelegate {
 
     suspend fun createStores()
 
+    @Deprecated("Use explicit database lifecycle operations; schema removal requires a migration")
     suspend fun destroyStores()
 
     suspend fun save(tableName: String, data: Any, keys: List<BoundStoreKey>)
@@ -85,11 +98,28 @@ public interface StoreDelegate {
 }
 
 public open class Store<ValueType>(
-    private val delegate: StoreDelegate,
-    private val tableName: String,
+    internal val delegate: StoreDelegate,
+    internal val tableName: String,
     private val writer: KFunction1<ValueType, ByteArray>,
     private val reader: KFunction1<ByteArray, ValueType>
 ) {
+    constructor(database: Database, name: StoreName, writer: KFunction1<ValueType, ByteArray>, reader: KFunction1<ByteArray, ValueType>) :
+        this(database.delegate, name.value, writer, reader)
+
+    internal fun encodeRow(value: ValueType): StoreRow = StoreRow(
+        if (delegate.isSerialized) writer(value) else value as Any,
+        indices.map { it.key.bind(it.accessor(value)) },
+    )
+    internal fun decodeData(data: Any): ValueType {
+        try {
+            @Suppress("UNCHECKED_CAST")
+            return if (delegate.isSerialized) reader(data as ByteArray) else data as ValueType
+        } catch (error: Throwable) {
+            if (error is kotlinx.coroutines.CancellationException) throw error
+            throw StoreFailure.CorruptRecord(error)
+        }
+    }
+
     sealed class Query<ValueType, IndexType> {
         inner class Eq<ValueType, IndexType>(
             val index: Index<ValueType, IndexType>,
@@ -157,7 +187,7 @@ public open class Store<ValueType>(
                 val value = this
 
                 compositeIndices.map {
-                    it.key.bind(it.accessor(value)!!)
+                    it.key.bind(it.accessor(value))
                 }
             }
         ) {
@@ -166,14 +196,59 @@ public open class Store<ValueType>(
         }
     }
 
-    private var isPrepared = AtomicBoolean(false)
+    private val preparationMutex = Mutex()
+    private var preparation: CompletableDeferred<Unit>? = null
     private val indices = mutableListOf<Index<ValueType, *>>()
     private var primaryKeyIndex: Index<ValueType, *>? = null
 
     suspend fun prepare() {
-        if (isPrepared.compareAndSwap(expected = false, new = true)) {
-            delegate.registerStore(tableName, indices.map { it.key }, primaryKeyIndex?.let { it.key })
+        var owner = false
+        val pending = preparationMutex.withLock {
+            preparation ?: CompletableDeferred<Unit>().also { preparation = it; owner = true }
         }
+        if (!owner) { pending.await(); return }
+        try {
+            delegate.registerStore(tableName, indices.map { it.key }, primaryKeyIndex?.key)
+            pending.complete(Unit)
+        } catch (error: Throwable) {
+            pending.completeExceptionally(error)
+            kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+                preparationMutex.withLock { if (preparation === pending) preparation = null }
+            }
+            throw error
+        }
+    }
+
+    protected fun <T, R> mappedIndex(
+        name: IndexName,
+        property: KProperty1<ValueType, T>,
+        codec: StorageCodec<T, R>,
+    ): TypedIndex<ValueType, T> {
+        val key = codec.key(name)
+        require(key.name == name.value)
+        indices.add(CodecIndex(name.value, key) { codec.encode(property.get(this)) })
+        return TypedIndex(name, key) { key.bind(codec.encode(it) as Any) }
+    }
+
+    protected fun <T : Any, R> nullableMappedIndex(
+        name: IndexName, property: KProperty1<ValueType, T?>, codec: StorageCodec<T, R>,
+    ): TypedIndex<ValueType, T> {
+        val original = codec.key(name)
+        val nullable: StoreKey<*> = when (original) {
+            is StoreKey.StringKey -> StoreKey.StringKey(name.value, true)
+            is StoreKey.SerializedKey -> StoreKey.SerializedKey(name.value, true)
+            is StoreKey.LongKey -> StoreKey.LongKey(name.value, true)
+            is StoreKey.IntegerKey -> StoreKey.IntegerKey(name.value, true)
+            is StoreKey.BooleanKey -> StoreKey.BooleanKey(name.value, true)
+            is StoreKey.CompositeKey -> throw StoreFailure.InvalidUsage("Declare nullable composite components separately")
+        }
+        @Suppress("UNCHECKED_CAST") val key = nullable as StoreKey<R?>
+        indices.add(CodecIndex(name.value, key) { property.get(this)?.let { codec.encode(it) } })
+        return TypedIndex(name, key) { key.bind(codec.encode(it)) }
+    }
+
+    protected fun <T> primaryKey(index: TypedIndex<ValueType, T>) {
+        primaryKeyIndex = indices.single { it.name == index.name.value }
     }
 
     protected fun primaryKey(index: Index<ValueType, *>) {
@@ -227,6 +302,7 @@ public open class Store<ValueType>(
         accessor(this) ?: ""
     }.also { indices.add(it) }
 
+    @Deprecated("Use mappedIndex with an explicit persisted IndexName and a StorageCodec")
     protected fun <IndexType> longMappedIndex(
         accessor: KProperty1<ValueType, IndexType?>,
         writer: KFunction1<IndexType, Long>,
@@ -237,6 +313,7 @@ public open class Store<ValueType>(
         writer(value)
     }.also { indices.add(it) }
 
+    @Deprecated("Use mappedIndex with an explicit persisted IndexName and a StorageCodec")
     protected fun <IndexType> booleanMappedIndex(
         accessor: KProperty1<ValueType, IndexType?>,
         writer: KFunction1<IndexType, Boolean>,
@@ -247,6 +324,7 @@ public open class Store<ValueType>(
         writer(value)
     }.also { indices.add(it) }
 
+    @Deprecated("Use mappedIndex with an explicit persisted IndexName and a StorageCodec")
     protected fun <IndexType> stringMappedIndex(
         accessor: KProperty1<ValueType, IndexType?>,
         writer: KFunction1<IndexType, String>,
@@ -262,7 +340,7 @@ public open class Store<ValueType>(
 
         return if (delegate.isSerialized) {
             LazyMapList(dataList) {
-                reader(it as ByteArray)
+                decodeData(it)
             }
         } else {
             @Suppress("UNCHECKED_CAST")
@@ -272,16 +350,14 @@ public open class Store<ValueType>(
 
     protected suspend fun getMany(relations: List<StoreRelation>): List<ValueType> =
         delegate.getMany(tableName, relations).map {
-            if (delegate.isSerialized) reader(it as ByteArray) else { @Suppress("UNCHECKED_CAST") (it as ValueType) }
+            if (delegate.isSerialized) decodeData(it) else { @Suppress("UNCHECKED_CAST") (it as ValueType) }
         }
 
     protected suspend fun get(query: StoreRelation? = null): ValueType? {
         val data = delegate.get(tableName, query)
 
         return if (delegate.isSerialized) {
-            (data as? ByteArray)?.let {
-                reader(it)
-            }
+            data?.let { decodeData(it) }
         } else {
             @Suppress("UNCHECKED_CAST")
             data as? ValueType
@@ -299,7 +375,7 @@ public open class Store<ValueType>(
     protected suspend fun saveAll(values: List<ValueType>) {
         delegate.saveAll(tableName, values.map { value ->
             StoreRow(if (delegate.isSerialized) writer(value) else value as Any,
-                indices.map { it.key.bind(it.accessor(value)!!) })
+                indices.map { it.key.bind(it.accessor(value)) })
         })
     }
 
@@ -313,7 +389,7 @@ public open class Store<ValueType>(
         }
 
         val keys = indices.map {
-            it.key.bind(it.accessor(value)!!)
+            it.key.bind(it.accessor(value))
         }
 
         delegate.save(tableName, data, keys)

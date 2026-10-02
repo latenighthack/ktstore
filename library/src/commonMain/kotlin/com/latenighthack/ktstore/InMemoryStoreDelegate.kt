@@ -7,8 +7,9 @@ import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
-private fun BoundStoreKey.toAny(): Any? {
+internal fun BoundStoreKey.toAny(): Any? {
     return when (val key = this) {
+        is BoundStoreKey.NullKey -> null
         is BoundStoreKey.SerializedKey -> key.value.toComparable()
         is BoundStoreKey.StringKey -> key.value
         is BoundStoreKey.BooleanKey -> key.value
@@ -52,16 +53,36 @@ fun ByteArray.toComparable(): ComparableByteArray {
     return ComparableByteArray(this)
 }
 
-public class InMemoryStoreDelegate : TransactionalStoreDelegate {
+public class InMemoryStoreDelegate : ScopedStoreDelegate, LifecycleStoreDelegate, IndexedQueryDelegate {
+    private var closed = false
+    override suspend fun close() {
+        if (coroutineContext[Transaction]?.owner === this) throw StoreFailure.InvalidUsage()
+        transactionMutex.withLock { closed = true }
+    }
+    override suspend fun deleteDatabase() { close(); activeStores.clear(); activeStoreData.clear() }
+    override suspend fun <T> transaction(stores: Set<String>, mode: TransactionMode, block: suspend () -> T): T {
+        if (!activeStores.keys.containsAll(stores)) throw StoreFailure.InvalidUsage()
+        return transaction(block)
+    }
     private val transactionMutex = Mutex()
     private class Transaction(val owner: InMemoryStoreDelegate) : AbstractCoroutineContextElement(Key) {
+        var rollbackCause: Throwable? = null
         companion object Key : CoroutineContext.Key<Transaction>
     }
     override suspend fun <T> transaction(block: suspend () -> T): T {
-        if (coroutineContext[Transaction]?.owner === this) return block()
+        if (closed) throw StoreFailure.Closed()
+        val current = coroutineContext[Transaction]?.takeIf { it.owner === this }
+        if (current != null) {
+            try { return block() } catch (error: Throwable) { current.rollbackCause = error; throw error }
+        }
         return transactionMutex.withLock {
             val snapshot = activeStoreData.mapValues { (_, store) -> store.values.toMap() }
-            try { withContext(Transaction(this)) { block() } }
+            val transaction = Transaction(this)
+            try {
+                val result = withContext(transaction) { block() }
+                transaction.rollbackCause?.let { throw StoreFailure.Aborted(it) }
+                result
+            }
             catch (error: Throwable) {
                 snapshot.forEach { (name, rows) -> activeStoreData.getValue(name).values.apply { clear(); putAll(rows) } }
                 throw error
@@ -88,7 +109,7 @@ public class InMemoryStoreDelegate : TransactionalStoreDelegate {
         val mutex: Mutex = Mutex()
     )
 
-    data class DataRow<T>(val data: T, val values: MutableMap<Any, Any>)
+    data class DataRow<T>(val data: T, val values: MutableMap<Any, Any?>)
 
     private val registeredStores = mutableMapOf<String, StoreDescriptor>()
     private val activeStores = mutableMapOf<String, StoreDescriptor>()
@@ -102,7 +123,7 @@ public class InMemoryStoreDelegate : TransactionalStoreDelegate {
 
     override suspend fun createStores() {
         activeStores.putAll(registeredStores)
-        activeStoreData.putAll(activeStores.keys.map { Pair(it, ActiveStore(mutableMapOf())) })
+        activeStores.keys.forEach { activeStoreData.getOrPut(it) { ActiveStore(mutableMapOf()) } }
     }
 
     override suspend fun destroyStores() {
@@ -111,6 +132,7 @@ public class InMemoryStoreDelegate : TransactionalStoreDelegate {
     }
 
     private suspend fun <T> modifyTable(tableName: String, callback: (MutableMap<Any, DataRow<*>>) -> T): T {
+        if (closed) throw StoreFailure.Closed()
         val store = activeStoreData[tableName]!!
 
         return if (coroutineContext[Transaction]?.owner === this) callback(store.values)
@@ -122,10 +144,10 @@ public class InMemoryStoreDelegate : TransactionalStoreDelegate {
         val primaryKey = activeStores[tableName]!!.primaryKey!!
         var primaryKeyValue: Any? = null
 
-        for (key in keys) {
+        for (key in normalizeKeys(activeStores.getValue(tableName).keys, keys)) {
             val value = key.toAny()
 
-            row.values[key.name] = value!!
+            row.values[key.name] = value
 
             if (key.name == primaryKey.name) {
                 primaryKeyValue = value
@@ -143,7 +165,7 @@ public class InMemoryStoreDelegate : TransactionalStoreDelegate {
 
     override suspend fun getAll(tableName: String, relation: StoreRelation?): List<Any> {
         return modifyTable(tableName) {
-            it.filterValues(relation.toPredicate()).values.map { it.data as Any }
+            it.filterValues(relation.toPredicate()).entries.sortedWith { a, b -> compareValues(a.key, b.key) }.map { it.value.data as Any }
         }
     }
 
@@ -161,6 +183,30 @@ public class InMemoryStoreDelegate : TransactionalStoreDelegate {
         modifyTable(tableName) {
             it.clear()
         }
+    }
+
+    private fun bound(key: StoreKey<*>, row: DataRow<*>, keys: List<StoreKey<*>>): BoundStoreKey = if (key is StoreKey.CompositeKey)
+        BoundStoreKey.CompositeKey(key.name, key.names, key.names.map { name -> bound(keys.first { it.name == name }, row, keys) })
+        else key.bind((row.values[key.name] as? ComparableByteArray)?.rawValue ?: row.values[key.name])
+
+    override suspend fun query(tableName: String, query: IndexedQuery, identity: String, version: Int): QueryPage = modifyTable(tableName) { rows ->
+        query.validate(identity, version, tableName)
+        val declaration = activeStores.getValue(tableName)
+        if (declaration.keys.none { it.name == query.index.name }) throw StoreFailure.InvalidUsage()
+        validateOrderedPrimary(declaration.primaryKey!!, declaration.keys)
+        val sign = if (query.direction == SortDirection.ASCENDING) 1 else -1
+        val matches = rows.values.map { IndexedRow(it.data as Any, bound(query.index, it, activeStores.getValue(tableName).keys), bound(declaration.primaryKey!!, it, declaration.keys)) }
+            .filter { row -> query.matches(row.index) && (query.after?.let { token ->
+                val compare = compareKeys(row.index, token.indexKey).takeIf { it != 0 } ?: compareKeys(row.primary, token.primaryKey)
+                compare * sign > 0
+            } ?: true) }.sortedWith { a, b -> (compareKeys(a.index, b.index).takeIf { it != 0 } ?: compareKeys(a.primary, b.primary)) * sign }
+        page(matches.take(query.limit + 1), query, identity, version, tableName)
+    }
+    override suspend fun count(tableName: String, query: IndexedQuery): Long = modifyTable(tableName) { rows -> rows.values.count { query.matches(bound(query.index, it, activeStores.getValue(tableName).keys)) }.toLong() }
+    override suspend fun deleteBatch(tableName: String, query: IndexedQuery, identity: String, version: Int): Int = transaction {
+        val result = query(tableName, query, identity, version)
+        result.rows.forEach { delete(tableName, StoreRelation.Eq(it.primary)) }
+        result.rows.size
     }
 
     override val isSerialized: Boolean = false
