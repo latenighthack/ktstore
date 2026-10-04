@@ -1,0 +1,5 @@
+ktstore-history-lock-v1
+5a484547259bd87f16ef51318ef74522f45d5f51f123154b85180e7bf2e0f5bc  migration-example-spec/src/commonMain/kotlin/example/UsersFixtures.kt
+8a4f30ce19fc36fd18da782d9f26a37e78f6f9ed1f089ffa014bd9a60ec56a47  migration-example-spec/src/commonMain/kotlin/example/UsersMapping.kt
+ec07fba2482ab1f6647a9cdb1d08faa9662a2f6c93c11c7ebd0a2099e0eb307e  migration-example-spec/src/commonMain/kotlin/example/UsersV1.kt
+d5eea86342cc2976c7a989f540fe7b1a1619d02231fd2b8f9d443cc2335b7a60  migration-example-spec/src/commonMain/kotlin/example/UsersV2.kt

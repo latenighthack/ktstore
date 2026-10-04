@@ -10,9 +10,11 @@ interface StorageCodec<T, Representation> {
 
 class TypedIndex<Record, T> internal constructor(
     val name: IndexName,
-    val key: StoreKey<*>,
+    key: StoreKey<*>,
     private val bind: (T) -> BoundStoreKey,
 ) {
+    private val storedKey = if (key is StoreKey.CompositeKey) StoreKey.CompositeKey(key.name, key.names.toList()) else key
+    val key: StoreKey<*> get() = if (storedKey is StoreKey.CompositeKey) StoreKey.CompositeKey(storedKey.name, storedKey.names.toList()) else storedKey
     fun eq(value: T): StoreRelation.Eq = StoreRelation.Eq { bind(value) }
     fun query(limit: Int, lower: T? = null, upper: T? = null, lowerInclusive: Boolean = true, upperInclusive: Boolean = true,
               direction: SortDirection = SortDirection.ASCENDING, after: LocalContinuation? = null): IndexedQuery =

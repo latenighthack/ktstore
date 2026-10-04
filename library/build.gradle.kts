@@ -50,6 +50,9 @@ kotlin {
             }
         }
         val commonTest by getting {
+            kotlin.srcDir("../migration-example-spec/src/commonMain/kotlin")
+            kotlin.srcDir("../migration-example/src/migrations/main")
+            kotlin.srcDir("../migration-example/src/migrations/test")
             dependencies {
                 implementation(libs.kotlin.test)
                 implementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
@@ -57,6 +60,9 @@ kotlin {
         }
         val androidInstrumentedTest by getting {
             kotlin.srcDir("src/commonTest/kotlin")
+            kotlin.srcDir("../migration-example-spec/src/commonMain/kotlin")
+            kotlin.srcDir("../migration-example/src/migrations/main")
+            kotlin.srcDir("../migration-example/src/migrations/test")
             dependencies {
                 implementation(kotlin("test-junit"))
                 implementation("androidx.test:runner:1.5.2")

@@ -106,10 +106,27 @@ public open class Store<ValueType>(
     constructor(database: Database, name: StoreName, writer: KFunction1<ValueType, ByteArray>, reader: KFunction1<ByteArray, ValueType>) :
         this(database.delegate, name.value, writer, reader)
 
-    internal fun encodeRow(value: ValueType): StoreRow = StoreRow(
-        if (delegate.isSerialized) writer(value) else value as Any,
-        indices.map { it.key.bind(it.accessor(value)) },
-    )
+    private var definition: StoreDefinition<ValueType>? = null
+    constructor(database: Database, definition: StoreDefinition<ValueType>) :
+        this(database, definition.storeName, definition::encodePayload, definition::decode) {
+        val declared = database.configuration.stores.singleOrNull { it.name == definition.storeName }
+        require(declared?.signature() == definition.declaration.signature()) { "Definition does not match configured store" }
+        this.definition = definition
+    }
+    private fun registerIndex(index: Index<ValueType, *>) {
+        check(definition == null) { "Definition-backed stores cannot declare local indexes" }
+        indices.add(index)
+    }
+    internal fun encodeRow(value: ValueType): StoreRow {
+        definition?.let {
+            val row = it.encodeRow(value)
+            return if (delegate.isSerialized) row else StoreRow(value as Any, row.keys)
+        }
+        return StoreRow(
+            if (delegate.isSerialized) writer(value) else value as Any,
+            indices.map { it.key.bind(it.accessor(value)) },
+        )
+    }
     internal fun decodeData(data: Any): ValueType {
         try {
             @Suppress("UNCHECKED_CAST")
@@ -208,7 +225,8 @@ public open class Store<ValueType>(
         }
         if (!owner) { pending.await(); return }
         try {
-            delegate.registerStore(tableName, indices.map { it.key }, primaryKeyIndex?.key)
+            val declaration = definition?.declaration
+            delegate.registerStore(tableName, declaration?.keys ?: indices.map { it.key }, declaration?.primaryKey ?: primaryKeyIndex?.key)
             pending.complete(Unit)
         } catch (error: Throwable) {
             pending.completeExceptionally(error)
@@ -226,7 +244,7 @@ public open class Store<ValueType>(
     ): TypedIndex<ValueType, T> {
         val key = codec.key(name)
         require(key.name == name.value)
-        indices.add(CodecIndex(name.value, key) { codec.encode(property.get(this)) })
+        registerIndex(CodecIndex(name.value, key) { codec.encode(property.get(this)) })
         return TypedIndex(name, key) { key.bind(codec.encode(it) as Any) }
     }
 
@@ -243,15 +261,17 @@ public open class Store<ValueType>(
             is StoreKey.CompositeKey -> throw StoreFailure.InvalidUsage("Declare nullable composite components separately")
         }
         @Suppress("UNCHECKED_CAST") val key = nullable as StoreKey<R?>
-        indices.add(CodecIndex(name.value, key) { property.get(this)?.let { codec.encode(it) } })
+        registerIndex(CodecIndex(name.value, key) { property.get(this)?.let { codec.encode(it) } })
         return TypedIndex(name, key) { key.bind(codec.encode(it)) }
     }
 
     protected fun <T> primaryKey(index: TypedIndex<ValueType, T>) {
+        check(definition == null) { "Definition-backed stores cannot declare local indexes" }
         primaryKeyIndex = indices.single { it.name == index.name.value }
     }
 
     protected fun primaryKey(index: Index<ValueType, *>) {
+        check(definition == null) { "Definition-backed stores cannot declare local indexes" }
         primaryKeyIndex = index
     }
 
@@ -261,7 +281,7 @@ public open class Store<ValueType>(
         val name = "composite_" + names.joinToString("_")
 
         return Index.CompositeIndex<ValueType>(name, names, compositeIndices)
-            .also { indices.add(it) }
+            .also { registerIndex(it) }
     }
 
     protected fun <IndexType> serializedIndex(
@@ -272,35 +292,35 @@ public open class Store<ValueType>(
         val value = accessor(this)!!
 
         writer(value)
-    }.also { indices.add(it) }
+    }.also { registerIndex(it) }
 
     protected fun bytesIndex(
         accessor: KProperty1<ValueType, ByteArray>,
         overrideName: String? = null
     ) = Index.SerializedIndex<ValueType>(overrideName ?: (accessor.name)) {
         accessor(this)
-    }.also { indices.add(it) }
+    }.also { registerIndex(it) }
 
     protected fun longIndex(
         accessor: KProperty1<ValueType, Long?>,
         overrideName: String? = null
     ) = Index.LongIndex<ValueType>(overrideName ?: (accessor.name)) {
         accessor(this) ?: 0L
-    }.also { indices.add(it) }
+    }.also { registerIndex(it) }
 
     protected fun booleanIndex(
         accessor: KProperty1<ValueType, Boolean?>,
         overrideName: String? = null
     ) = Index.BooleanIndex<ValueType>(overrideName ?: (accessor.name)) {
         accessor(this) ?: false
-    }.also { indices.add(it) }
+    }.also { registerIndex(it) }
 
     protected fun stringIndex(
         accessor: KProperty1<ValueType, String?>,
         overrideName: String? = null
     ) = Index.StringIndex<ValueType>(overrideName ?: (accessor.name)) {
         accessor(this) ?: ""
-    }.also { indices.add(it) }
+    }.also { registerIndex(it) }
 
     @Deprecated("Use mappedIndex with an explicit persisted IndexName and a StorageCodec")
     protected fun <IndexType> longMappedIndex(
@@ -311,7 +331,7 @@ public open class Store<ValueType>(
         val value = accessor(this)!!
 
         writer(value)
-    }.also { indices.add(it) }
+    }.also { registerIndex(it) }
 
     @Deprecated("Use mappedIndex with an explicit persisted IndexName and a StorageCodec")
     protected fun <IndexType> booleanMappedIndex(
@@ -322,7 +342,7 @@ public open class Store<ValueType>(
         val value = accessor(this)!!
 
         writer(value)
-    }.also { indices.add(it) }
+    }.also { registerIndex(it) }
 
     @Deprecated("Use mappedIndex with an explicit persisted IndexName and a StorageCodec")
     protected fun <IndexType> stringMappedIndex(
@@ -333,7 +353,7 @@ public open class Store<ValueType>(
         val value = accessor(this)!!
 
         writer(value)
-    }.also { indices.add(it) }
+    }.also { registerIndex(it) }
 
     protected suspend fun getAll(query: StoreRelation? = null): List<ValueType> {
         val dataList = delegate.getAll(tableName, query)
@@ -373,25 +393,13 @@ public open class Store<ValueType>(
     }
 
     protected suspend fun saveAll(values: List<ValueType>) {
-        delegate.saveAll(tableName, values.map { value ->
-            StoreRow(if (delegate.isSerialized) writer(value) else value as Any,
-                indices.map { it.key.bind(it.accessor(value)) })
-        })
+        delegate.saveAll(tableName, values.map(::encodeRow))
     }
 
     protected suspend fun deleteMany(relations: List<StoreRelation>) = delegate.deleteMany(tableName, relations)
 
     protected suspend fun save(value: ValueType) {
-        val data = if (delegate.isSerialized) {
-            writer(value)
-        } else {
-            value as Any
-        }
-
-        val keys = indices.map {
-            it.key.bind(it.accessor(value))
-        }
-
-        delegate.save(tableName, data, keys)
+        val row = encodeRow(value)
+        delegate.save(tableName, row.data, row.keys)
     }
 }

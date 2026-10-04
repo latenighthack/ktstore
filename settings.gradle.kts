@@ -1,4 +1,5 @@
 pluginManagement {
+    includeBuild("migration-gradle-plugin")
     repositories {
         google()
         mavenCentral()
@@ -20,3 +21,6 @@ include(":library")
 apply(from = "gradle/fh-workspace.settings.gradle")
 
 include(":browser-tests")
+
+include(":migration-tooling")
+include(":migration-example-spec", ":migration-example")

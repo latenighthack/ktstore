@@ -32,6 +32,14 @@ private fun operation(action: String): Promise<String> = CoroutineScope(Dispatch
         action
     } finally { db.close() }
 }
+private suspend fun runConformance(name: String, block: () -> Any?) {
+    try { block().unsafeCast<Promise<Unit>>().await() }
+    catch (error: Throwable) {
+        val message = "Conformance failed: $name: ${error.message}"
+        throw js("new Error(message)")
+    }
+}
+
 fun main() {
     val global = js("globalThis")
     global.ktstoreConformance = {
@@ -39,15 +47,22 @@ fun main() {
             val tests = object : PersistentConformance() {
                 override fun backend(config: DatabaseConfiguration): LifecycleStoreDelegate = IndexDB(config)
             }
-            tests.wholeReadsUseLogicalPrimaryOrdering().unsafeCast<Promise<Unit>>().await()
-            tests.commitRollbackAndSecondaryDeletion().unsafeCast<Promise<Unit>>().await()
-            tests.readonlyAndUndeclaredStoreAccessRollback().unsafeCast<Promise<Unit>>().await()
-            tests.boundedQueriesUsePrimaryTieBreakerAndSparseNulls().unsafeCast<Promise<Unit>>().await()
-            tests.binaryCompositeKeysAndAtomicBatches().unsafeCast<Promise<Unit>>().await()
-            tests.concurrentReadModifyWriteIsSerialized().unsafeCast<Promise<Unit>>().await()
-            tests.migrationFailurePreservesOldDataAndVersion().unsafeCast<Promise<Unit>>().await()
-            tests.independentConnectionsAndDeletionInvalidateOldHandles().unsafeCast<Promise<Unit>>().await()
-            tests.typedWrappersPreserveNominalKeysAndNulls().unsafeCast<Promise<Unit>>().await()
+            runConformance("wholeReadsUseLogicalPrimaryOrdering") { tests.wholeReadsUseLogicalPrimaryOrdering() }
+            runConformance("commitRollbackAndSecondaryDeletion") { tests.commitRollbackAndSecondaryDeletion() }
+            runConformance("readonlyAndUndeclaredStoreAccessRollback") { tests.readonlyAndUndeclaredStoreAccessRollback() }
+            runConformance("boundedQueriesUsePrimaryTieBreakerAndSparseNulls") { tests.boundedQueriesUsePrimaryTieBreakerAndSparseNulls() }
+            runConformance("binaryCompositeKeysAndAtomicBatches") { tests.binaryCompositeKeysAndAtomicBatches() }
+            runConformance("concurrentReadModifyWriteIsSerialized") { tests.concurrentReadModifyWriteIsSerialized() }
+            runConformance("definitionBackedStoresShareEncodingAndQueries") { tests.definitionBackedStoresShareEncodingAndQueries() }
+            runConformance("generatedMigrationsVerifyHistoricalFixtures") { tests.generatedMigrationsVerifyHistoricalFixtures() }
+            runConformance("typedMigrationCollisionAndCorruptionRollBack") { tests.typedMigrationCollisionAndCorruptionRollBack() }
+            runConformance("typedCreateAndRemoveVerifyEmptyDatabaseSchemas") { tests.typedCreateAndRemoveVerifyEmptyDatabaseSchemas() }
+            runConformance("typedBinaryCompositeCollisionsComparePersistedValues") { tests.typedBinaryCompositeCollisionsComparePersistedValues() }
+            runConformance("typedMigrationRejectsIncorrectSourceWithoutRunningMapping") { tests.typedMigrationRejectsIncorrectSourceWithoutRunningMapping() }
+            runConformance("typedMultiStepMigrationUsesIntermediateDefinitions") { tests.typedMultiStepMigrationUsesIntermediateDefinitions() }
+            runConformance("migrationFailurePreservesOldDataAndVersion") { tests.migrationFailurePreservesOldDataAndVersion() }
+            runConformance("independentConnectionsAndDeletionInvalidateOldHandles") { tests.independentConnectionsAndDeletionInvalidateOldHandles() }
+            runConformance("typedWrappersPreserveNominalKeysAndNulls") { tests.typedWrappersPreserveNominalKeysAndNulls() }
             tests.orderedLongBoundaries()
             "ok"
         }

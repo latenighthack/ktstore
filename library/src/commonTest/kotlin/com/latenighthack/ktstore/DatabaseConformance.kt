@@ -13,6 +13,25 @@ abstract class DatabaseConformance {
     protected abstract fun backend(config: DatabaseConfiguration): LifecycleStoreDelegate
     private fun row(idValue: String, groupValue: String = "same") = StoreRow(idValue.encodeToByteArray(), listOf(id.bind(idValue), group.bind(groupValue)))
 
+    @Test fun definitionBackedStoresShareEncodingAndQueries() = runTest { withContext(Dispatchers.Default) {
+        val config = example.UsersHistory.v2.configuration("defined-${kotlin.random.Random.nextInt()}")
+        val db = Database(config, backend(config))
+        val users = example.UsersStore(db)
+        try {
+            users.prepare()
+            db.open()
+            db.transaction(setOf(example.UsersV2.storeName)) {
+                save(users, example.UserV2(1, "Alice", true))
+                assertEquals(example.UserV2(1, "Alice", true), get(users, example.UsersV2.id.eq(1)))
+            }
+            assertEquals(listOf(example.UserV2(1, "Alice", true)), users.findByName("Alice").toList())
+            users.put(example.UserV2(2, "Bob", false))
+            db.transaction(setOf(example.UsersV2.storeName), TransactionMode.READ_ONLY) {
+                assertEquals(2, getAll(users).size)
+            }
+        } finally { db.deleteDatabase() }
+    } }
+
     @Test fun wholeReadsUseLogicalPrimaryOrdering() = runTest { withContext(Dispatchers.Default) {
         val longKey = StoreKey.LongKey("id")
         val config = DatabaseConfiguration("ordering-${kotlin.random.Random.nextInt()}", 1, listOf(

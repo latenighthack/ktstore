@@ -44,5 +44,22 @@ class CompileContractTest {
         """.trimIndent())
         assertEquals(ExitCode.COMPILATION_ERROR, invalid.first, invalid.second)
         assertTrue(invalid.second.contains("restricted", ignoreCase = true), invalid.second)
+    }    @Test fun typedMigrationsRejectWrongMappingAndSuspension() {
+        val prefix = """
+            import com.latenighthack.ktstore.*
+            fun check(old: StoreDefinition<String>, target: StoreDefinition<Int>) {
+        """.trimIndent()
+        val valid = compile(prefix + "mappedMigration(old, target, { it.length }) }")
+        assertEquals(ExitCode.OK, valid.first, valid.second)
+        val invalid = compile(prefix + "mappedMigration(old, target, { it }) }")
+        assertEquals(ExitCode.COMPILATION_ERROR, invalid.first, invalid.second)
+        val suspending = compile("""
+            import com.latenighthack.ktstore.*
+            import kotlinx.coroutines.delay
+            val migration = DatabaseMigration(1, 2) { delay(1) }
+        """.trimIndent())
+        assertEquals(ExitCode.COMPILATION_ERROR, suspending.first, suspending.second)
+        assertTrue(suspending.second.contains("restricted", ignoreCase = true))
     }
+
 }

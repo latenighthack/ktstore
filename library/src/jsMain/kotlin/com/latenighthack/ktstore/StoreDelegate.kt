@@ -59,6 +59,7 @@ class IndexDB(
             "QuotaExceededError" -> StoreFailure.Quota(cause)
             "ConstraintError", "DataError" -> StoreFailure.Constraint(cause)
             "AbortError" -> StoreFailure.Aborted(cause)
+            "VersionError" -> StoreFailure.Migration(cause)
             "InvalidStateError", "TransactionInactiveError" -> StoreFailure.Closed()
             else -> StoreFailure.Unavailable(cause)
         }
@@ -112,7 +113,18 @@ class IndexDB(
                         else {
                             val config = configuration ?: throw StoreFailure.Migration()
                             val scope = UpgradeScope(db, raw)
-                            config.steps(old).forEach { runMigration(scope, it.migrate) }
+                            val steps = config.steps(old)
+                            steps.firstOrNull()?.sourceSchema?.let { schema ->
+                                if (db.objectStoreNames.contains("ktstore_schema") as Boolean) {
+                                    val expected = DatabaseConfiguration("schema", 1, schema).fingerprint()
+                                    if (this@IndexDB.request(raw.objectStore("ktstore_schema").get("declaration")) != expected) throw StoreFailure.Migration()
+                                }
+                            }
+                            steps.forEach { step ->
+                                step.sourceSchema?.let { validateUpgrade(db, raw, it) }
+                                runMigration(scope, step.migrate)
+                                step.targetSchema?.let { validateUpgrade(db, raw, it) }
+                            }
                         }
                         if (configuration != null) {
                             val metadata = if (db.objectStoreNames.contains("ktstore_schema") as Boolean) raw.objectStore("ktstore_schema") else db.createObjectStore("ktstore_schema")
@@ -142,6 +154,10 @@ class IndexDB(
                         if (configuration != null) {
                             if (!(db.objectStoreNames.contains("ktstore_schema") as Boolean)) throw StoreFailure.Migration()
                             val tx = db.transaction((declarations.keys + "ktstore_schema").toTypedArray(), "readonly")
+                            val validationComplete = CompletableDeferred<Unit>()
+                            tx.oncomplete = { _: dynamic -> validationComplete.complete(Unit); Unit }
+                            tx.onabort = { _: dynamic -> validationComplete.completeExceptionally(failure(tx.error)); Unit }
+                            tx.onerror = { _: dynamic -> validationComplete.completeExceptionally(failure(tx.error)); Unit }
                             declarations.values.forEach { declaration ->
                                 val store = tx.objectStore(declaration.name)
                                 if (store.keyPath != declaration.primary?.name) throw StoreFailure.Migration()
@@ -152,6 +168,9 @@ class IndexDB(
                                 }
                             }
                             if (this@IndexDB.request(tx.objectStore("ktstore_schema").get("declaration")) != configuration.fingerprint()) throw StoreFailure.Migration()
+                            // An open handle must not expose a still-active validation transaction.
+                            // Empty schemas can close/delete immediately after open.
+                            validationComplete.await()
                         }
                         if (abandoned || closed) { db.close(); completion.completeExceptionally(StoreFailure.Closed()) }
                         else {
@@ -371,7 +390,26 @@ class IndexDB(
         result.rows.size
     }
 
+    private fun validateUpgrade(db: dynamic, tx: dynamic, schema: List<StoreDeclaration>) {
+        val names = (0 until (db.objectStoreNames.length as Int)).map { db.objectStoreNames.item(it) as String }.filter { it != "ktstore_schema" }.toSet()
+        if (names != schema.map { it.name.value }.toSet()) throw StoreFailure.Migration()
+        schema.forEach { validateDeclaration(tx, it) }
+    }
+    private fun validateDeclaration(tx: dynamic, declaration: StoreDeclaration) {
+        val store = tx.objectStore(declaration.name.value)
+        if (store.keyPath != declaration.primaryKey.name) throw StoreFailure.Migration()
+        val indices = (0 until (store.indexNames.length as Int)).map { store.indexNames.item(it) as String }.toSet()
+        if (indices != declaration.keys.map { indexName(it) }.toSet()) throw StoreFailure.Migration()
+        declaration.keys.forEach { key ->
+            val index = store.index(indexName(key))
+            val actual = index.keyPath
+            val expected: dynamic = if (key is StoreKey.CompositeKey) key.names.toTypedArray() else key.name
+            if (index.unique == true || js("JSON.stringify(actual)") != js("JSON.stringify(expected)")) throw StoreFailure.Migration()
+        }
+    }
+
     private inner class UpgradeScope(val db: dynamic, val tx: dynamic) : MigrationOperations {
+        override suspend fun validateStore(declaration: StoreDeclaration) { validateDeclaration(tx, declaration) }
         override suspend fun createStore(declaration: StoreDeclaration) { createStore(db, Declaration(declaration.name.value, declaration.keys, declaration.primaryKey)) }
         override suspend fun removeStore(name: StoreName) { db.deleteObjectStore(name.value) }
         override suspend fun addIndex(store: StoreName, key: StoreKey<*>) { createIndex(tx.objectStore(store.value), key) }
@@ -379,15 +417,17 @@ class IndexDB(
         override suspend fun transform(store: StoreName, transform: (ByteArray) -> StoreRow) {
             val target = tx.objectStore(store.value)
             val records = request(target.getAll()) as Array<dynamic>
+            val converted = records.map { transform(it._value as ByteArray) }
             request(target.clear())
-            records.forEach { val converted = transform(it._value as ByteArray); request(target.put(row(converted.data, converted.keys))) }
+            converted.forEach { request(target.put(row(it.data, it.keys))) }
         }
         override suspend fun rebuildStore(store: StoreName, declaration: StoreDeclaration, transform: (ByteArray) -> StoreRow) {
             val records = request(tx.objectStore(store.value).getAll()) as Array<dynamic>
+            val converted = records.map { transform(it._value as ByteArray) }
             db.deleteObjectStore(store.value)
             createStore(declaration)
             val target = tx.objectStore(declaration.name.value)
-            records.forEach { val converted = transform(it._value as ByteArray); request(target.put(row(converted.data, converted.keys))) }
+            converted.forEach { request(target.put(row(it.data, it.keys))) }
         }
     }
 }

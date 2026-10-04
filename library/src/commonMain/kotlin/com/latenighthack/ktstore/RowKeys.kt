@@ -27,3 +27,10 @@ internal fun normalizeKeys(declarations: List<StoreKey<*>>, values: List<BoundSt
         } else scalars.getValue(key.name)
     }
 }
+
+/** Snapshot binary values as well as ordered composite components. */
+internal fun copyKeys(keys: List<BoundStoreKey>): List<BoundStoreKey> = keys.map { when (it) {
+    is BoundStoreKey.SerializedKey -> BoundStoreKey.SerializedKey(it.name, it.value.copyOf())
+    is BoundStoreKey.CompositeKey -> BoundStoreKey.CompositeKey(it.name, it.names.toList(), copyKeys(it.values))
+    else -> it
+} }

@@ -1,0 +1,5 @@
+ktstore-schema-manifest-v1
+version 1
+users 39:users:id:id:false:int,name:false:string7:user-v123:2:id3:int4:name6:string
+version 2
+users 61:users:id:enabled:false:boolean,id:false:int,name:false:string7:user-v241:7:enabled7:boolean2:id3:int4:name6:string

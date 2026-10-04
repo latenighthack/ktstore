@@ -84,40 +84,37 @@ class SqlStoreDelegate(private val driver: SqlDriver, private val blobType: Stri
                 val old = if (persisted == 0 && existing) config.legacyVersion ?: throw StoreFailure.Migration() else persisted
                 if (old > config.version) throw StoreFailure.Migration()
                 if (old == 0) stores.toList().forEach { create(it) }
-                else config.steps(old).forEach { runMigration(SqlMigrationScope(), it.migrate) }
+                else {
+                    val steps = config.steps(old)
+                    steps.firstOrNull()?.sourceSchema?.let { schema ->
+                        if (scalar("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'ktstore_schema'") > 0) {
+                            val metadata = driver.selectAll("SELECT fingerprint FROM ktstore_schema WHERE id = 1")
+                            try { if (!metadata.step() || metadata.getText(0) != DatabaseConfiguration("schema", 1, schema).fingerprint()) throw StoreFailure.Migration() }
+                            finally { metadata.finalize() }
+                        }
+                    }
+                    steps.forEach { step ->
+                    step.sourceSchema?.let { schema ->
+                        validateStoreNames(schema)
+                        validateSchema(schema)
+                        stores.clear()
+                        stores.addAll(schema.map { TableDescriptor(it.name.value, it.keys, it.primaryKey) })
+                    }
+                    runMigration(SqlMigrationScope(), step.migrate)
+                    step.targetSchema?.let { schema ->
+                        validateStoreNames(schema)
+                        validateSchema(schema)
+                        stores.clear()
+                        stores.addAll(schema.map { TableDescriptor(it.name.value, it.keys, it.primaryKey) })
+                    }
+                }
+                }
                 if (old == config.version) {
                     val metadata = driver.selectAll("SELECT fingerprint FROM ktstore_schema WHERE id = 1")
                     try { if (!metadata.step() || metadata.getText(0) != config.fingerprint()) throw StoreFailure.Migration() }
                     finally { metadata.finalize() }
                 }
-                config.stores.forEach { declaration ->
-                    val table = declaration.name.value
-                    val query = driver.selectAll("PRAGMA index_list($table)")
-                    val indices = mutableSetOf<String>()
-                    try { while (query.step()) indices.add(query.getText(1)) } finally { query.finalize() }
-                    if (!declaration.keys.all { "idx_${table}_${it.name}" in indices }) throw StoreFailure.Migration()
-                    declaration.keys.forEach { key ->
-                        val info = driver.selectAll("PRAGMA index_info(idx_${table}_${key.name})")
-                        val columns = mutableListOf<String>()
-                        try { while (info.step()) columns.add(info.getText(2)) } finally { info.finalize() }
-                        val expected = if (key is StoreKey.CompositeKey) key.names else listOf(key.name)
-                        if (columns != expected) throw StoreFailure.Migration()
-                    }
-                    val info = driver.selectAll("PRAGMA table_info($table)")
-                    val columns = mutableMapOf<String, Triple<String, Boolean, Int>>()
-                    try { while (info.step()) columns[info.getText(1)] = Triple(info.getText(2).uppercase(), info.getLong(3) != 0L, info.getLong(5).toInt()) }
-                    finally { info.finalize() }
-                    val scalarKeys = declaration.keys.filter { it !is StoreKey.CompositeKey }
-                    if (columns.keys != (scalarKeys.map { it.name } + "__value").toSet()) throw StoreFailure.Migration()
-                    scalarKeys.forEach { key ->
-                        val column = columns.getValue(key.name)
-                        val type = when (key) { is StoreKey.SerializedKey -> "BLOB"; is StoreKey.StringKey -> "TEXT"; else -> "INTEGER" }
-                        if (column.first != type || column.second == key.nullable) throw StoreFailure.Migration()
-                    }
-                    val primary = declaration.primaryKey
-                    val expectedPrimary = if (primary is StoreKey.CompositeKey) primary.names else listOf(primary.name)
-                    if (columns.filterValues { it.third > 0 }.entries.sortedBy { it.value.third }.map { it.key } != expectedPrimary) throw StoreFailure.Migration()
-                }
+                validateSchema(config.stores)
                 if (old != config.version) {
                     driver.createTable("CREATE TABLE IF NOT EXISTS ktstore_schema (id INTEGER PRIMARY KEY, fingerprint TEXT NOT NULL)")
                     val metadata = driver.execute("REPLACE INTO ktstore_schema (id, fingerprint) VALUES (1, ?)")
@@ -132,8 +129,50 @@ class SqlStoreDelegate(private val driver: SqlDriver, private val blobType: Stri
         }
     }
 
+    private suspend fun validateStoreNames(declarations: List<StoreDeclaration>) {
+        val query = driver.selectAll("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND substr(name, 1, 8) != 'ktstore_' AND name != 'android_metadata'")
+        val names = mutableSetOf<String>()
+        try { while (query.step()) names.add(query.getText(0)) } finally { query.finalize() }
+        if (names != declarations.map { it.name.value }.toSet()) throw StoreFailure.Migration()
+    }
+
+    private suspend fun validateSchema(declarations: List<StoreDeclaration>) {
+        declarations.forEach { declaration ->
+            val table = declaration.name.value
+            val query = driver.selectAll("PRAGMA index_list($table)")
+            val indices = mutableSetOf<String>()
+            try { while (query.step()) indices.add(query.getText(1)) } finally { query.finalize() }
+            if (!declaration.keys.all { "idx_${table}_${it.name}" in indices }) throw StoreFailure.Migration()
+            declaration.keys.forEach { key ->
+                val info = driver.selectAll("PRAGMA index_info(idx_${table}_${key.name})")
+                val columns = mutableListOf<String>()
+                try { while (info.step()) columns.add(info.getText(2)) } finally { info.finalize() }
+                val expected = if (key is StoreKey.CompositeKey) key.names else listOf(key.name)
+                if (columns != expected) throw StoreFailure.Migration()
+            }
+            val info = driver.selectAll("PRAGMA table_info($table)")
+            val columns = mutableMapOf<String, Triple<String, Boolean, Int>>()
+            try { while (info.step()) columns[info.getText(1)] = Triple(info.getText(2).uppercase(), info.getLong(3) != 0L, info.getLong(5).toInt()) }
+            finally { info.finalize() }
+            val scalarKeys = declaration.keys.filter { it !is StoreKey.CompositeKey }
+            if (columns.keys != (scalarKeys.map { it.name } + "__value").toSet()) throw StoreFailure.Migration()
+            scalarKeys.forEach { key ->
+                val column = columns.getValue(key.name)
+                val type = when (key) { is StoreKey.SerializedKey -> "BLOB"; is StoreKey.StringKey -> "TEXT"; else -> "INTEGER" }
+                if (column.first != type || column.second == key.nullable) throw StoreFailure.Migration()
+            }
+            val primary = declaration.primaryKey
+            val expectedPrimary = if (primary is StoreKey.CompositeKey) primary.names else listOf(primary.name)
+            if (columns.filterValues { it.third > 0 }.entries.sortedBy { it.value.third }.map { it.key } != expectedPrimary) throw StoreFailure.Migration()
+        }
+    }
+
     private suspend fun create(store: TableDescriptor) {
         SqlHelper.generateCreateCommands(store.tableName, store.keys, store.primaryKey, blobType).forEach { driver.createTable(it) }
+        createOrderingIndices(store)
+    }
+
+    private suspend fun createOrderingIndices(store: TableDescriptor) {
         if (configuration != null) store.keys.filter { it !is StoreKey.CompositeKey }.forEach { key ->
             val columns = (listOf(key.name) + (store.primaryKey?.columnName?.split(", ") ?: emptyList())).distinct()
             driver.createTable("CREATE INDEX IF NOT EXISTS idx_${store.tableName}_${key.name}_order ON ${store.tableName} (${columns.joinToString(",")})")
@@ -147,6 +186,7 @@ class SqlStoreDelegate(private val driver: SqlDriver, private val blobType: Stri
     }
 
     private inner class SqlMigrationScope : MigrationOperations {
+        override suspend fun validateStore(declaration: StoreDeclaration) = validateSchema(listOf(declaration))
         override suspend fun createStore(declaration: StoreDeclaration) {
             val descriptor = TableDescriptor(declaration.name.value, declaration.keys, declaration.primaryKey)
             create(descriptor)
@@ -170,6 +210,7 @@ class SqlStoreDelegate(private val driver: SqlDriver, private val blobType: Stri
             val rows = migrationRows(store.value).map(transform)
             deleteAll(store.value)
             saveAll(store.value, rows)
+            createOrderingIndices(stores.single { it.tableName == store.value })
         }
         override suspend fun rebuildStore(store: StoreName, declaration: StoreDeclaration, transform: (ByteArray) -> StoreRow) {
             val rows = migrationRows(store.value).map(transform)

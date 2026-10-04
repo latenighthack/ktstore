@@ -69,6 +69,8 @@ Legacy IndexedDB databases start at version 1 and legacy Android databases at ve
 
 Existing payloads, names, decimal-string IndexedDB `Long` keys, and legacy Android blob-literal text are not rewritten implicitly. The legacy Android delegate continues binding blob keys as their existing text representation; the new configured database path binds actual blobs. Convert existing records through an explicit migration before switching representations. Recovering legacy null sentinels requires application decoding because the library cannot infer whether an empty string or zero originally represented null.
 
+Definition-backed stores and typed migration generation are available through `StoreDefinition<T>`, `MigrationCatalog`, and the migration Gradle plugin. See [the authoring and verification guide](docs/migrations.md) and the complete `migration-example-spec` / `migration-example` projects.
+
 ## Typed indexes and nullable values
 
 ```kotlin

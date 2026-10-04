@@ -19,7 +19,8 @@ jobs:
         with:
           node-version: '22'
       - uses: gradle/actions/setup-gradle@v4
-      - run: ./gradlew :library:jvmTest :browser-tests:jsBrowserDevelopmentWebpack --console=plain
+      - run: ./gradlew :library:jvmTest :migration-tooling:jvmTest :migration-example:verifyStoreMigrations :browser-tests:jsBrowserDevelopmentWebpack --console=plain
+      - run: ./gradlew -p migration-gradle-plugin test validatePlugins --console=plain
       - run: npm ci --prefix browser-tests
       - run: browser-tests/node_modules/.bin/playwright install --with-deps chromium firefox webkit
       - name: IndexedDB lifecycle tests

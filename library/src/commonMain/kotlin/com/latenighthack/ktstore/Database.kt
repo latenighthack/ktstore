@@ -47,10 +47,21 @@ data class DatabaseConfiguration(
     }
 }
 
-class DatabaseMigration(val fromVersion: Int, val toVersion: Int, val migrate: suspend MigrationScope.() -> Unit)
+class DatabaseMigration private constructor(
+    val fromVersion: Int, val toVersion: Int,
+    internal val sourceSchema: List<StoreDeclaration>?, internal val targetSchema: List<StoreDeclaration>?,
+    val migrate: suspend MigrationScope.() -> Unit,
+) {
+    constructor(fromVersion: Int, toVersion: Int, migrate: suspend MigrationScope.() -> Unit) : this(fromVersion, toVersion, null, null, migrate)
+    companion object {
+        fun configured(fromVersion: Int, toVersion: Int, source: List<StoreDeclaration>, target: List<StoreDeclaration>, migrate: suspend MigrationScope.() -> Unit): DatabaseMigration =
+            DatabaseMigration(fromVersion, toVersion, source.map { it.snapshot() }, target.map { it.snapshot() }, migrate)
+    }
+}
 
 /** Migration callbacks contain database awaits and bounded synchronous transformations only. */
 interface MigrationOperations {
+    suspend fun validateStore(declaration: StoreDeclaration): Unit = throw StoreFailure.InvalidUsage("Typed migrations require schema validation")
     suspend fun createStore(declaration: StoreDeclaration)
     suspend fun removeStore(name: StoreName)
     suspend fun addIndex(store: StoreName, key: StoreKey<*>)
@@ -71,6 +82,21 @@ class MigrationScope internal constructor(private val operations: MigrationOpera
             override fun resumeWith(result: Result<T>) { result.exceptionOrNull()?.let { failure = it }; continuation.resumeWith(result) }
         })
         COROUTINE_SUSPENDED
+    }
+    suspend fun <A, B> transformMappedStore(source: StoreDefinition<A>, target: StoreDefinition<B>, mapping: (A) -> B) = call {
+        require(source.declaration.signature() == target.declaration.signature() && source.indexEncodings == target.indexEncodings)
+        operations.validateStore(source.declaration)
+        operations.transform(source.storeName, mappedRows(source, target, mapping))
+        operations.validateStore(target.declaration)
+    }
+    suspend fun <A, B> rebuildMappedStore(source: StoreDefinition<A>, target: StoreDefinition<B>, mapping: (A) -> B) = call {
+        operations.validateStore(source.declaration)
+        operations.rebuildStore(source.storeName, target.declaration, mappedRows(source, target, mapping))
+        operations.validateStore(target.declaration)
+    }
+    internal suspend fun <A, B> applyMapping(entry: MappedStoreMigration<A, B>) {
+        if (entry.operation == "transform") transformMappedStore(entry.source, entry.target, entry.mapping)
+        else rebuildMappedStore(entry.source, entry.target, entry.mapping)
     }
     suspend fun createStore(declaration: StoreDeclaration) = call { operations.createStore(declaration) }
     suspend fun removeStore(name: StoreName) = call { operations.removeStore(name) }

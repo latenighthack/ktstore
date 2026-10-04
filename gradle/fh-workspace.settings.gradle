@@ -22,13 +22,20 @@ if (manifestPath) {
         if (version) useVersion(version)
     }
     gradle.beforeProject { p ->
+        // KMP registers project metadata coordinates while applying its plugin. Set the
+        // workspace version before that registration, not only after evaluation.
+        def earlyVersion = overrides[p.group.toString()]
+        if (earlyVersion) p.version = earlyVersion
         // Also cover repositories declared by legacy builds and buildscript classpaths.
         // Project dependencies use settings repositories in workspace mode.
         configureRepos(p.buildscript.repositories)
         [p.configurations, p.buildscript.configurations].each { configs ->
             configs.configureEach { c ->
                 c.resolutionStrategy.eachDependency { d ->
-                    if (overrides[d.requested.group]) d.useVersion(overrides[d.requested.group])
+                    def localProject = gradle.rootProject.allprojects.any { candidate ->
+                        candidate.group.toString() == d.requested.group && candidate.name == d.requested.name
+                    }
+                    if (!localProject && overrides[d.requested.group]) d.useVersion(overrides[d.requested.group])
                 }
                 c.dependencies.all { d ->
                     if (d instanceof org.gradle.api.artifacts.ExternalModuleDependency && overrides[d.group]) {
