@@ -4,7 +4,7 @@ kotlin = "2.3.10"
 kotlinx = "1.9.0"
 android-minSdk = "24"
 android-compileSdk = "34"
-postgresql = "42.3.1"
+postgresql = "42.7.14"
 hikari = "5.1.0"
 
 [libraries]
