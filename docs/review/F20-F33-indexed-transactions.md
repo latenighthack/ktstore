@@ -5,3 +5,7 @@ The red regression demonstrated that quota/count and bounded pruning required a 
 Verified common regressions for logical commit/rollback, read-only and nested-store bounds, undeclared indexes and concurrent helper rejection; an actual SQLite regression confirms pruning rolls back physically. Full JVM tests passed; JS, Android and Apple production source compilations passed. Helpers require sequential local database work and do not authorize network awaits. Existing unrestricted typed Store operations are unchanged.
 
 Red log: /tmp/ktstore-review-F20-F33-red.log. Green: /tmp/ktstore-review-F20-F33-platforms.log.
+
+# F33 lifecycle registry follow-up
+
+A separate red regression reproduced retained empty identity sets after the last handle closed. Registry release now removes empty identity entries, and reopening an already closed handle cannot register it again. A failed partial open remains owned until close completes, so cleanup is not skipped. Tests cover two handles sharing an identity, the final close, closed reopen and a delegate failing partway through open. Full JVM tests and the focused lifecycle tests pass.

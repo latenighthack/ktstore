@@ -270,6 +270,7 @@ class Database(configuration: DatabaseConfiguration, internal val delegate: Life
         private val deletions = mutableMapOf<String, CompletableDeferred<Unit>>()
     }
     suspend fun open() {
+        mutex.withLock { if (closed) throw StoreFailure.Closed() }
         while (true) {
             val deletion = registryMutex.withLock {
                 val pending = deletions[configuration.identity]
@@ -279,13 +280,23 @@ class Database(configuration: DatabaseConfiguration, internal val delegate: Life
             if (deletion == null) break
             deletion.await()
         }
-        mutex.withLock {
+        try { mutex.withLock {
             if (closed) throw StoreFailure.Closed()
             if (!opened) {
                 configuration.stores.forEach { delegate.registerStore(it.name.value, it.keys, it.primaryKey) }
                 delegate.createStores()
                 opened = true
             }
+        } } catch (error: Throwable) {
+            // A failed partial open remains owned for close; a concurrently closed handle does not.
+            if (mutex.withLock { closed }) releaseRegistration()
+            throw error
+        }
+    }
+    private suspend fun releaseRegistration() = registryMutex.withLock {
+        handles[configuration.identity]?.let { owned ->
+            owned.remove(this)
+            if (owned.isEmpty()) handles.remove(configuration.identity)
         }
     }
     suspend fun <T> transaction(
@@ -417,7 +428,7 @@ class Database(configuration: DatabaseConfiguration, internal val delegate: Life
                 pending.forEach { it.cancel(CancellationException("Database connection closed")) }
                 pending.joinAll()
                 delegate.close()
-                registryMutex.withLock { handles[configuration.identity]?.remove(this@Database) }
+                releaseRegistration()
                 completion.complete(Unit)
             } catch (error: Throwable) { completion.completeExceptionally(error); throw error }
         }
