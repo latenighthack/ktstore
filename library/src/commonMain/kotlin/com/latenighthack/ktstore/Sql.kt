@@ -121,6 +121,7 @@ class SqlStoreDelegate(private val driver: SqlDriver, private val blobType: Stri
                     try { if (!metadata.step() || metadata.getText(0) != config.fingerprint()) throw StoreFailure.Migration() }
                     finally { metadata.finalize() }
                 }
+                validateStoreNames(config.stores)
                 validateSchema(config.stores)
                 if (old != config.version) {
                     driver.createTable("CREATE TABLE IF NOT EXISTS ktstore_schema (id INTEGER PRIMARY KEY, fingerprint TEXT NOT NULL" +
@@ -145,6 +146,7 @@ class SqlStoreDelegate(private val driver: SqlDriver, private val blobType: Stri
             else "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND substr(name, 1, 8) != 'ktstore_' AND name != 'android_metadata'")
         val names = mutableSetOf<String>()
         try { while (query.step()) names.add(query.getText(0)) } finally { query.finalize() }
+        names.removeAll(configuration?.externalTables.orEmpty())
         if (names != declarations.map { physicalName(it.name.value) }.toSet()) throw StoreFailure.Migration()
     }
 

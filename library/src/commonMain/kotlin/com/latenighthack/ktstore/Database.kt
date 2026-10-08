@@ -33,12 +33,19 @@ data class DatabaseConfiguration(
     val legacyVersion: Int? = null,
     val operationTimeoutMillis: Long = 30_000,
     val busyTimeoutMillis: Int = 5_000,
+    /** Optional tables managed by another owner; ktstore never creates or migrates them. */
+    val externalTables: Set<String> = emptySet(),
 ) {
     init {
         require(identity.isNotBlank() && version > 0)
         require(operationTimeoutMillis > 0 && busyTimeoutMillis >= 0)
         require(stores.map { it.name }.distinct().size == stores.size)
         require(stores.none { it.name.value.startsWith("ktstore_") })
+        require(externalTables.all { it.matches(Regex("[a-z_][a-z0-9_]{0,62}")) &&
+            !it.startsWith("ktstore_") && !it.startsWith("sqlite_") && it != "android_metadata" })
+        val ownedNames = (stores + migrations.flatMap { it.sourceSchema.orEmpty() + it.targetSchema.orEmpty() })
+            .map { it.name.value.lowercase().take(63) }.toSet()
+        require(externalTables.none { it in ownedNames }) { "External and owned tables must not overlap" }
         require(migrations.map { it.fromVersion }.distinct().size == migrations.size)
         require(migrations.all { it.fromVersion >= 1 && it.toVersion == it.fromVersion + 1 && it.toVersion <= version })
     }
@@ -382,4 +389,5 @@ internal fun DatabaseConfiguration.snapshot(): DatabaseConfiguration = copy(
         StoreDeclaration(declaration.name, keys, keys.single { it.name == declaration.primaryKey.name })
     },
     migrations = migrations.toList(),
+    externalTables = externalTables.toSet(),
 )

@@ -135,3 +135,11 @@ repository operations in one backend transaction with a process advisory lock.
 Callbacks must do sequential local database work only; no network awaits or child
 coroutines. A caught backend failure remains rollback-only. Handle owners close
 the database after stopping all consumers.
+
+Configured databases reject undeclared tables. Applications sharing one physical
+schema with another owner must explicitly list its optional tables in
+`DatabaseConfiguration.externalTables`. Names are canonical lowercase SQL identifiers
+(up to 63 characters), cannot overlap any owned migration schema, and cannot use
+reserved metadata names. These tables are excluded only from ownership inventory;
+ktstore neither creates them nor includes them in the owned schema fingerprint.
+Unexpected unlisted tables still cause migration/open failure.

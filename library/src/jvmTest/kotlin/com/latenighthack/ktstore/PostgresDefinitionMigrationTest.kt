@@ -54,6 +54,42 @@ class PostgresDefinitionMigrationTest {
         }
     }
 
+    @Test fun configuredMigrationPreservesExternalControlTablesAndRejectsUnknownTables(): Unit = runBlocking {
+        val base = System.getenv("KTSTORE_TEST_PG_URL")
+        assumeTrue("KTSTORE_TEST_PG_URL is required for PostgreSQL verification", base != null)
+        val schema = "ktstore_external_${System.nanoTime()}"
+        DriverManager.getConnection(base).use { c -> c.createStatement().use { it.execute("CREATE SCHEMA $schema") } }
+        val url = base!! + (if ('?' in base) "&" else "?") + "currentSchema=$schema"
+        val config = definitionDatabaseConfiguration(schema, listOf(PgDefinitionV1))
+        val original = createPostgresDatabase(config, url)
+        try {
+            original.open(); PgRecords(original).put(PgRecord(1, 42)); original.close()
+            DriverManager.getConnection(url).use { c -> c.createStatement().use {
+                it.execute("CREATE TABLE room_claim (id INTEGER PRIMARY KEY, owner TEXT)")
+                it.execute("INSERT INTO room_claim VALUES (1, 'owner-a')")
+            } }
+            val compatible = config.copy(version = 4, migrations = config.migrations +
+                DatabaseMigration.configured(3, 4, config.stores, config.stores) {},
+                externalTables = setOf("room_claim", "session_gateway", "shard_map"))
+            val upgraded = createPostgresDatabase(compatible, url)
+            try { upgraded.open(); assertEquals(PgRecord(1, 42), PgRecords(upgraded).read(1)) }
+            finally { upgraded.close() }
+            val reopened = createPostgresDatabase(compatible, url)
+            try { reopened.open() } finally { reopened.close() }
+            DriverManager.getConnection(url).use { c -> c.createStatement().use {
+                val rows = it.executeQuery("SELECT owner FROM room_claim WHERE id = 1")
+                assertTrue(rows.next()); assertEquals("owner-a", rows.getString(1)); rows.close()
+                it.execute("CREATE TABLE undeclared (id INTEGER PRIMARY KEY)")
+            } }
+            val invalid = createPostgresDatabase(compatible, url)
+            try { assertFailsWith<StoreFailure.Migration> { invalid.open() } }
+            finally { invalid.close() }
+        } finally {
+            original.close()
+            DriverManager.getConnection(base).use { c -> c.createStatement().use { it.execute("DROP SCHEMA $schema CASCADE") } }
+        }
+    }
+
     @Test fun failedMigrationRollsBackPayloadSchemaAndVersion() = runBlocking {
         val base = System.getenv("KTSTORE_TEST_PG_URL")
         assumeTrue("KTSTORE_TEST_PG_URL is required for PostgreSQL verification", base != null)
