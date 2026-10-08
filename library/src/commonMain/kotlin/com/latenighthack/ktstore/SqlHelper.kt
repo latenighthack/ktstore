@@ -48,7 +48,7 @@ object SqlHelper {
                 is StoreKey.StringKey -> "TEXT"
                 is StoreKey.BooleanKey -> "INTEGER"
                 is StoreKey.IntegerKey -> "INTEGER"
-                is StoreKey.LongKey -> "INTEGER"
+                is StoreKey.LongKey -> if (blobType == "BYTEA") "BIGINT" else "INTEGER"
                 is StoreKey.CompositeKey -> null
             }
 

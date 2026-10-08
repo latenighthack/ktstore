@@ -75,19 +75,26 @@ class SqlStoreDelegate(private val driver: SqlDriver, private val blobType: Stri
     override suspend fun createStores() {
         val config = configuration
         if (config == null) { stores.forEach { create(it) }; return }
-        if (blobType != "BLOB" || driver !is ManagedSqlDriver) throw StoreFailure.InvalidUsage()
+        if (blobType !in setOf("BLOB", "BYTEA") || driver !is ManagedSqlDriver) throw StoreFailure.InvalidUsage()
         val before = stores.toList()
         try {
-            transaction {
-                val persisted = scalar("PRAGMA user_version").toInt()
-                val existing = scalar("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'android_metadata'") > 0
+            transaction("ktstore.schema.${config.identity}") {
+                val metadataExists = scalar(if (blobType == "BYTEA")
+                    "SELECT count(*) FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'ktstore_schema'"
+                    else "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'ktstore_schema'") > 0
+                val persisted = if (blobType == "BYTEA") {
+                    if (metadataExists) scalar("SELECT version FROM ktstore_schema WHERE id = 1").toInt() else 0
+                } else scalar("PRAGMA user_version").toInt()
+                val existing = scalar(if (blobType == "BYTEA")
+                    "SELECT count(*) FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' AND left(table_name, 8) != 'ktstore_'"
+                    else "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'android_metadata' AND name NOT LIKE 'ktstore_%'") > 0
                 val old = if (persisted == 0 && existing) config.legacyVersion ?: throw StoreFailure.Migration() else persisted
                 if (old > config.version) throw StoreFailure.Migration()
                 if (old == 0) stores.toList().forEach { create(it) }
                 else {
                     val steps = config.steps(old)
                     steps.firstOrNull()?.sourceSchema?.let { schema ->
-                        if (scalar("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'ktstore_schema'") > 0) {
+                        if (metadataExists) {
                             val metadata = driver.selectAll("SELECT fingerprint FROM ktstore_schema WHERE id = 1")
                             try { if (!metadata.step() || metadata.getText(0) != DatabaseConfiguration("schema", 1, schema).fingerprint()) throw StoreFailure.Migration() }
                             finally { metadata.finalize() }
@@ -116,11 +123,14 @@ class SqlStoreDelegate(private val driver: SqlDriver, private val blobType: Stri
                 }
                 validateSchema(config.stores)
                 if (old != config.version) {
-                    driver.createTable("CREATE TABLE IF NOT EXISTS ktstore_schema (id INTEGER PRIMARY KEY, fingerprint TEXT NOT NULL)")
-                    val metadata = driver.execute("REPLACE INTO ktstore_schema (id, fingerprint) VALUES (1, ?)")
+                    driver.createTable("CREATE TABLE IF NOT EXISTS ktstore_schema (id INTEGER PRIMARY KEY, fingerprint TEXT NOT NULL" +
+                        (if (blobType == "BYTEA") ", version INTEGER NOT NULL)" else ")"))
+                    val metadata = driver.execute(if (blobType == "BYTEA")
+                        "INSERT INTO ktstore_schema (id, fingerprint, version) VALUES (1, ?, ${config.version}) ON CONFLICT (id) DO UPDATE SET fingerprint = EXCLUDED.fingerprint, version = EXCLUDED.version"
+                        else "REPLACE INTO ktstore_schema (id, fingerprint) VALUES (1, ?)")
                     try { metadata.bindText(0, config.fingerprint()); check(!metadata.step()) } finally { metadata.finalize() }
                 }
-                driver.createTable("PRAGMA user_version = ${config.version}")
+                if (blobType != "BYTEA") driver.createTable("PRAGMA user_version = ${config.version}")
             }
         } catch (error: Throwable) {
             stores.clear(); stores.addAll(before)
@@ -130,13 +140,57 @@ class SqlStoreDelegate(private val driver: SqlDriver, private val blobType: Stri
     }
 
     private suspend fun validateStoreNames(declarations: List<StoreDeclaration>) {
-        val query = driver.selectAll("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND substr(name, 1, 8) != 'ktstore_' AND name != 'android_metadata'")
+        val query = driver.selectAll(if (blobType == "BYTEA")
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' AND left(table_name, 8) != 'ktstore_'"
+            else "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND substr(name, 1, 8) != 'ktstore_' AND name != 'android_metadata'")
         val names = mutableSetOf<String>()
         try { while (query.step()) names.add(query.getText(0)) } finally { query.finalize() }
-        if (names != declarations.map { it.name.value }.toSet()) throw StoreFailure.Migration()
+        if (names != declarations.map { physicalName(it.name.value) }.toSet()) throw StoreFailure.Migration()
+    }
+
+    private fun physicalName(name: String) = if (blobType == "BYTEA") name.lowercase().take(63) else name
+
+    private suspend fun indexColumns(table: String, name: String): List<String> {
+        val query = driver.selectAll(if (blobType == "BYTEA")
+            "SELECT a.attname FROM pg_index i JOIN pg_class t ON t.oid = i.indrelid JOIN pg_namespace n ON n.oid = t.relnamespace JOIN pg_class ix ON ix.oid = i.indexrelid CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, position) JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum WHERE n.nspname = current_schema() AND t.relname = '${physicalName(table)}' AND ix.relname = '${physicalName(name)}' ORDER BY k.position"
+            else "PRAGMA index_info($name)")
+        try { return buildList { while (query.step()) add(query.getText(if (blobType == "BYTEA") 0 else 2)) } }
+        finally { query.finalize() }
+    }
+
+    private suspend fun validatePostgresSchema(declarations: List<StoreDeclaration>) {
+        declarations.forEach { declaration ->
+            val table = physicalName(declaration.name.value)
+            val info = driver.selectAll("SELECT column_name, data_type, CASE WHEN is_nullable = 'NO' THEN 1 ELSE 0 END FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '$table'")
+            val columns = mutableMapOf<String, Pair<String, Boolean>>()
+            try { while (info.step()) columns[info.getText(0)] = info.getText(1) to (info.getLong(2) != 0L) } finally { info.finalize() }
+            val scalarKeys = declaration.keys.filter { it !is StoreKey.CompositeKey }
+            if (columns.keys != (scalarKeys.map { physicalName(it.name) } + "__value").toSet() || columns["__value"] != ("bytea" to true)) throw StoreFailure.Migration()
+            scalarKeys.forEach { key ->
+                val column = columns.getValue(physicalName(key.name))
+                val allowed = when (key) {
+                    is StoreKey.SerializedKey -> setOf("bytea")
+                    is StoreKey.StringKey -> setOf("text")
+                    is StoreKey.LongKey -> setOf("integer", "bigint") // Legacy PostgreSQL columns were INTEGER.
+                    else -> setOf("integer")
+                }
+                if (column.first !in allowed || column.second == key.nullable) throw StoreFailure.Migration()
+            }
+            declaration.keys.forEach { key ->
+                val expected = if (key is StoreKey.CompositeKey) key.names else listOf(key.name)
+                if (indexColumns(table, "idx_${table}_${key.name}") != expected.map(::physicalName)) throw StoreFailure.Migration()
+            }
+            val primary = driver.selectAll("SELECT a.attname FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid JOIN pg_namespace n ON n.oid = t.relnamespace CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS k(attnum, position) JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum WHERE n.nspname = current_schema() AND t.relname = '$table' AND c.contype = 'p' ORDER BY k.position")
+            val actual = mutableListOf<String>()
+            try { while (primary.step()) actual.add(primary.getText(0)) } finally { primary.finalize() }
+            val pk = declaration.primaryKey
+            val expected = if (pk is StoreKey.CompositeKey) pk.names else listOf(pk.name)
+            if (actual != expected.map(::physicalName)) throw StoreFailure.Migration()
+        }
     }
 
     private suspend fun validateSchema(declarations: List<StoreDeclaration>) {
+        if (blobType == "BYTEA") { validatePostgresSchema(declarations); return }
         declarations.forEach { declaration ->
             val table = declaration.name.value
             val query = driver.selectAll("PRAGMA index_list($table)")
@@ -186,6 +240,10 @@ class SqlStoreDelegate(private val driver: SqlDriver, private val blobType: Stri
     }
 
     private inner class SqlMigrationScope : MigrationOperations {
+        override suspend fun storeExists(name: StoreName): Boolean = scalar(if (blobType == "BYTEA")
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = '${physicalName(name.value)}'"
+            else "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = '${name.value}'") > 0
+
         override suspend fun validateStore(declaration: StoreDeclaration) = validateSchema(listOf(declaration))
         override suspend fun createStore(declaration: StoreDeclaration) {
             val descriptor = TableDescriptor(declaration.name.value, declaration.keys, declaration.primaryKey)
@@ -310,10 +368,8 @@ class SqlStoreDelegate(private val driver: SqlDriver, private val blobType: Stri
         val components = if (primary is StoreKey.CompositeKey) primary.names.map { name -> declaration.keys.single { it.name == name } } else listOf(primary)
         if (components.any { it is StoreKey.StringKey || it is StoreKey.LongKey }) throw StoreFailure.InvalidUsage("Ordered queries require sortable primary keys")
         if (configuration != null) {
-            val inspection = driver.selectAll("PRAGMA index_info(idx_${table}_${index.name}_order)")
-            val actual = mutableListOf<String>()
-            try { while (inspection.step()) actual.add(inspection.getText(2)) } finally { inspection.finalize() }
-            if (actual != (listOf(index.name) + components.map { it.name }).distinct())
+            val actual = indexColumns(table, "idx_${table}_${index.name}_order")
+            if (actual != (listOf(index.name) + components.map { it.name }).distinct().map(::physicalName))
                 throw StoreFailure.InvalidUsage("Ordered query requires a migrated physical ordering index")
         }
         return index to components
