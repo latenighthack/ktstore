@@ -14,7 +14,7 @@ class ExternalTableConfigurationTest {
     @Test fun configurationSnapshotCopiesExternalOwnershipPolicy() {
         val names = mutableSetOf("room_claim")
         val config = definitionDatabaseConfiguration("external", listOf(UsersV1)).copy(externalTables = names)
-        val snapshot = config.snapshot()
+        val snapshot = Database(config, InMemoryStoreDelegate()).configuration
         names += "unexpected"
         assertEquals(setOf("room_claim"), snapshot.externalTables)
     }
