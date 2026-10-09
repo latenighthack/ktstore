@@ -208,6 +208,7 @@ class TransactionScope internal constructor(
     }
     suspend fun count(store: StoreName, query: IndexedQuery): Long = operation(store) {
         if (query.after != null) throw StoreFailure.InvalidUsage("Counts do not accept continuation")
+        query.validate(identity, version, store.value)
         (delegate as? IndexedQueryDelegate ?: throw StoreFailure.InvalidUsage()).count(store.value, query)
     }
     suspend fun deleteBatch(store: StoreName, query: IndexedQuery): Int = operation(store, true) {
@@ -374,12 +375,12 @@ class Database(configuration: DatabaseConfiguration, internal val delegate: Life
      */
     suspend fun query(store: StoreName, query: IndexedQuery): QueryPage {
         val owner = currentCoroutineContext()[Owner]
-        if (owner == null) return transaction(setOf(store), TransactionMode.READ_ONLY) { query(store, query) }
+        if (owner == null) return transaction(setOf(store), TransactionMode.READ_ONLY) { validateIndex(store, query); query(store, query) }
         return indexed(owner, store, query, false) { it.query(store.value, query, configuration.identity, configuration.version) }
     }
     suspend fun count(store: StoreName, query: IndexedQuery): Long {
         val owner = currentCoroutineContext()[Owner]
-        if (owner == null) return transaction(setOf(store), TransactionMode.READ_ONLY) { count(store, query) }
+        if (owner == null) return transaction(setOf(store), TransactionMode.READ_ONLY) { validateIndex(store, query); count(store, query) }
         return indexed(owner, store, query, false) {
             if (query.after != null) throw StoreFailure.InvalidUsage("Counts do not accept continuation")
             it.count(store.value, query)
@@ -387,8 +388,14 @@ class Database(configuration: DatabaseConfiguration, internal val delegate: Life
     }
     suspend fun deleteBatch(store: StoreName, query: IndexedQuery): Int {
         val owner = currentCoroutineContext()[Owner]
-        if (owner == null) return transaction(setOf(store)) { deleteBatch(store, query) }
+        if (owner == null) return transaction(setOf(store)) { validateIndex(store, query); deleteBatch(store, query) }
         return indexed(owner, store, query, true) { it.deleteBatch(store.value, query, configuration.identity, configuration.version) }
+    }
+    private fun validateIndex(store: StoreName, query: IndexedQuery) {
+        query.validate(configuration.identity, configuration.version, store.value)
+        val declaration = configuration.stores.singleOrNull { it.name == store } ?: throw StoreFailure.InvalidUsage()
+        if (declaration.keys.none { it.name == query.index.name && it::class == query.index::class })
+            throw StoreFailure.InvalidUsage("Index is not declared by this store")
     }
     private suspend fun <T> indexed(
         owner: Owner, store: StoreName, query: IndexedQuery, write: Boolean,
@@ -400,10 +407,7 @@ class Database(configuration: DatabaseConfiguration, internal val delegate: Life
                 (write && owner.mode == TransactionMode.READ_ONLY)) throw StoreFailure.InvalidUsage("Invalid indexed transaction access")
             locked = owner.state.gate.tryLock()
             if (!locked) throw StoreFailure.InvalidUsage("Parallel indexed operations are unsupported")
-            query.validate(configuration.identity, configuration.version, store.value)
-            val declaration = configuration.stores.singleOrNull { it.name == store } ?: throw StoreFailure.InvalidUsage()
-            if (declaration.keys.none { it.name == query.index.name && it::class == query.index::class })
-                throw StoreFailure.InvalidUsage("Index is not declared by this store")
+            validateIndex(store, query)
             currentCoroutineContext().ensureActive()
             return block(delegate as? IndexedQueryDelegate ?: throw StoreFailure.InvalidUsage("Indexed queries are unsupported"))
         } catch (error: Throwable) {

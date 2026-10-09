@@ -9,3 +9,7 @@ Red log: /tmp/ktstore-review-F20-F33-red.log. Green: /tmp/ktstore-review-F20-F33
 # F33 lifecycle registry follow-up
 
 A separate red regression reproduced retained empty identity sets after the last handle closed. Registry release now removes empty identity entries, and reopening an already closed handle cannot register it again. A failed partial open remains owned until close completes, so cleanup is not skipped. Tests cover two handles sharing an identity, the final close, closed reopen and a delegate failing partway through open. Full JVM tests and the focused lifecycle tests pass.
+
+# F38 count consistency follow-up
+
+An actual SQLite red regression showed a binary-indexed count rejecting a legacy Long primary key even though counting does not order or continue primary values. SQL counts now validate the declared index/bounds without imposing ordered-primary migration, matching browser and memory count behavior. Query/pruning still require sortable primary keys. Public helpers validate declared index shapes both inside and outside a current transaction; scoped counts validate bounds and reject continuations. Full JVM tests and JS/Android/Apple compilations pass.

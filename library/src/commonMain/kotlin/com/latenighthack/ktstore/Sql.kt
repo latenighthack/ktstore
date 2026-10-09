@@ -363,13 +363,13 @@ class SqlStoreDelegate(private val driver: SqlDriver, private val blobType: Stri
     override suspend fun getMany(tableName: String, relations: List<StoreRelation>): List<Any> =
         relations.flatMap { getAll(tableName, it) }
 
-    private suspend fun queryKeys(table: String, query: IndexedQuery): Pair<StoreKey<*>, List<StoreKey<*>>> {
+    private suspend fun queryKeys(table: String, query: IndexedQuery, ordered: Boolean = true): Pair<StoreKey<*>, List<StoreKey<*>>> {
         val declaration = stores.first { it.tableName == table }
         val index = declaration.keys.singleOrNull { it.name == query.index.name } ?: throw StoreFailure.InvalidUsage()
         val primary = declaration.primaryKey ?: throw StoreFailure.InvalidUsage()
         val components = if (primary is StoreKey.CompositeKey) primary.names.map { name -> declaration.keys.single { it.name == name } } else listOf(primary)
-        if (components.any { it is StoreKey.StringKey || it is StoreKey.LongKey }) throw StoreFailure.InvalidUsage("Ordered queries require sortable primary keys")
-        if (configuration != null) {
+        if (ordered && components.any { it is StoreKey.StringKey || it is StoreKey.LongKey }) throw StoreFailure.InvalidUsage("Ordered queries require sortable primary keys")
+        if (ordered && configuration != null) {
             val actual = indexColumns(table, "idx_${table}_${index.name}_order")
             if (actual != (listOf(index.name) + components.map { it.name }).distinct().map(::physicalName))
                 throw StoreFailure.InvalidUsage("Ordered query requires a migrated physical ordering index")
@@ -421,7 +421,9 @@ class SqlStoreDelegate(private val driver: SqlDriver, private val blobType: Stri
         return page(rows, query, identity, version, tableName)
     }
     override suspend fun count(tableName: String, query: IndexedQuery): Long {
-        val (_, primary) = queryKeys(tableName, query)
+        if (query.after != null) throw StoreFailure.InvalidUsage("Counts do not accept continuation")
+        query.validate("", 0, tableName)
+        val (_, primary) = queryKeys(tableName, query, ordered = false)
         val (where, args) = queryWhere(query.copy(after = null), primary)
         val select = driver.selectAll("SELECT count(*) FROM $tableName WHERE $where")
         try { args.forEachIndexed { i, key -> select.bind(i, key) }; check(select.step()); return select.getLong(0) }
