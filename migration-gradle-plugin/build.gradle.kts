@@ -17,7 +17,7 @@ dependencies { testImplementation(gradleTestKit()); testImplementation("junit:ju
 repositories { mavenCentral() }
 // Keep Gradle plugin resolution separate from application library version overrides.
 group = "com.latenighthack.ktstore.gradle"
-version = "0.2.1"
+version = "0.2.2"
 
 mavenPublishing {
     configureBasedOnAppliedPlugins(true, true)
