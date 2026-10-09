@@ -130,6 +130,7 @@ class IndexDB(
                             val metadata = if (db.objectStoreNames.contains("ktstore_schema") as Boolean) raw.objectStore("ktstore_schema") else db.createObjectStore("ktstore_schema")
                             this@IndexDB.request(metadata.put(configuration.fingerprint(), "declaration"))
                         }
+                        configuration?.let { validateNames(db, it.stores) }
                         declarations.values.forEach { declaration ->
                             if (!(db.objectStoreNames.contains(declaration.name) as Boolean)) throw StoreFailure.Migration()
                             val store = raw.objectStore(declaration.name)
@@ -152,6 +153,7 @@ class IndexDB(
                 val validate: suspend () -> Unit = {
                     try {
                         if (configuration != null) {
+                            validateNames(db, configuration.stores)
                             if (!(db.objectStoreNames.contains("ktstore_schema") as Boolean)) throw StoreFailure.Migration()
                             val tx = db.transaction((declarations.keys + "ktstore_schema").toTypedArray(), "readonly")
                             val validationComplete = CompletableDeferred<Unit>()
@@ -232,7 +234,10 @@ class IndexDB(
     override suspend fun <T> transaction(block: suspend () -> T): T =
         throw StoreFailure.InvalidUsage("IndexedDB transactions require participating stores")
     override suspend fun <T> transaction(lockKey: String, block: suspend () -> T): T =
-        throw StoreFailure.InvalidUsage("IndexedDB does not support advisory locks")
+        // IndexedDB serializes overlapping read-write transactions across handles/tabs. A logical
+        // owner participates in every declared data store, providing stronger global serialization
+        // than a keyed advisory lock. Existing Tx guards still forbid non-database suspension.
+        transaction(declarations.keys.toSet(), TransactionMode.READ_WRITE, block)
 
     override suspend fun <T> transaction(stores: Set<String>, mode: TransactionMode, block: suspend () -> T): T {
         val current = coroutineContext[Tx]
@@ -390,9 +395,12 @@ class IndexDB(
         result.rows.size
     }
 
-    private fun validateUpgrade(db: dynamic, tx: dynamic, schema: List<StoreDeclaration>) {
-        val names = (0 until (db.objectStoreNames.length as Int)).map { db.objectStoreNames.item(it) as String }.filter { it != "ktstore_schema" }.toSet()
+    private fun validateNames(db: dynamic, schema: List<StoreDeclaration>) {
+        val names = (0 until (db.objectStoreNames.length as Int)).map { db.objectStoreNames.item(it) as String }.filter { it != "ktstore_schema" && it !in configuration?.externalTables.orEmpty() }.toSet()
         if (names != schema.map { it.name.value }.toSet()) throw StoreFailure.Migration()
+    }
+    private fun validateUpgrade(db: dynamic, tx: dynamic, schema: List<StoreDeclaration>) {
+        validateNames(db, schema)
         schema.forEach { validateDeclaration(tx, it) }
     }
     private fun validateDeclaration(tx: dynamic, declaration: StoreDeclaration) {

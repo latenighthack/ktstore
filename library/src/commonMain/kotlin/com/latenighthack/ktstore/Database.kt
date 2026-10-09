@@ -33,12 +33,19 @@ data class DatabaseConfiguration(
     val legacyVersion: Int? = null,
     val operationTimeoutMillis: Long = 30_000,
     val busyTimeoutMillis: Int = 5_000,
+    /** Optional tables managed by another owner; ktstore never creates or migrates them. */
+    val externalTables: Set<String> = emptySet(),
 ) {
     init {
         require(identity.isNotBlank() && version > 0)
         require(operationTimeoutMillis > 0 && busyTimeoutMillis >= 0)
         require(stores.map { it.name }.distinct().size == stores.size)
         require(stores.none { it.name.value.startsWith("ktstore_") })
+        require(externalTables.all { it.matches(Regex("[a-z_][a-z0-9_]{0,62}")) &&
+            !it.startsWith("ktstore_") && !it.startsWith("sqlite_") && it != "android_metadata" })
+        val ownedNames = (stores + migrations.flatMap { it.sourceSchema.orEmpty() + it.targetSchema.orEmpty() })
+            .map { it.name.value.lowercase().take(63) }.toSet()
+        require(externalTables.none { it in ownedNames }) { "External and owned tables must not overlap" }
         require(migrations.map { it.fromVersion }.distinct().size == migrations.size)
         require(migrations.all { it.fromVersion >= 1 && it.toVersion == it.fromVersion + 1 && it.toVersion <= version })
     }
@@ -142,7 +149,7 @@ class TransactionScope internal constructor(
     private var active = true
     private var executing = false
     internal var failure: Throwable? = null
-    internal fun finish() { active = false }
+    internal fun finish() { active = false; context[Database.Owner]?.active = false }
 
     private suspend fun <T> operation(store: StoreName, write: Boolean = false, block: suspend () -> T): T =
         suspendCoroutineUninterceptedOrReturn { continuation ->
@@ -201,6 +208,7 @@ class TransactionScope internal constructor(
     }
     suspend fun count(store: StoreName, query: IndexedQuery): Long = operation(store) {
         if (query.after != null) throw StoreFailure.InvalidUsage("Counts do not accept continuation")
+        query.validate(identity, version, store.value)
         (delegate as? IndexedQueryDelegate ?: throw StoreFailure.InvalidUsage()).count(store.value, query)
     }
     suspend fun deleteBatch(store: StoreName, query: IndexedQuery): Int = operation(store, true) {
@@ -219,13 +227,16 @@ class TransactionScope internal constructor(
             throw error
         }
         executing = true
-        val nested = TransactionScope(delegate, stores.map { it.value }.toSet(), mode, context, identity, version)
+        val names = stores.map { it.value }.toSet()
+        val owner = context[Database.Owner]?.narrow(names, mode)
+        val nestedContext = if (owner == null) context else context + owner
+        val nested = TransactionScope(delegate, names, mode, nestedContext, identity, version)
         block.startCoroutine(nested, object : Continuation<T> {
             override val context: CoroutineContext = EmptyCoroutineContext
             override fun resumeWith(result: Result<T>) {
                 nested.finish()
                 executing = false
-                val error = nested.failure ?: result.exceptionOrNull()
+                val error = nested.failure ?: owner?.state?.failure ?: result.exceptionOrNull()
                 if (error != null) failure = error
                 continuation.resumeWith(if (error != null) Result.failure(error) else result)
             }
@@ -242,7 +253,16 @@ class Database(configuration: DatabaseConfiguration, internal val delegate: Life
     private var closed = false
     private var closing: CompletableDeferred<Unit>? = null
     private val jobs = mutableSetOf<Job>()
-    private class Owner(val database: Database, val keyed: Boolean = false) : AbstractCoroutineContextElement(Key) {
+    internal class AccessState {
+        val gate = Mutex()
+        var failure: Throwable? = null
+    }
+    internal class Owner(
+        val database: Database, val stores: Set<String>, val mode: TransactionMode,
+        val scoped: Boolean, val state: AccessState = AccessState(),
+    ) : AbstractCoroutineContextElement(Key) {
+        var active = true
+        fun narrow(stores: Set<String>, mode: TransactionMode) = Owner(database, stores, mode, true, state)
         companion object Key : CoroutineContext.Key<Owner>
     }
     companion object {
@@ -251,6 +271,7 @@ class Database(configuration: DatabaseConfiguration, internal val delegate: Life
         private val deletions = mutableMapOf<String, CompletableDeferred<Unit>>()
     }
     suspend fun open() {
+        mutex.withLock { if (closed) throw StoreFailure.Closed() }
         while (true) {
             val deletion = registryMutex.withLock {
                 val pending = deletions[configuration.identity]
@@ -260,13 +281,23 @@ class Database(configuration: DatabaseConfiguration, internal val delegate: Life
             if (deletion == null) break
             deletion.await()
         }
-        mutex.withLock {
+        try { mutex.withLock {
             if (closed) throw StoreFailure.Closed()
             if (!opened) {
                 configuration.stores.forEach { delegate.registerStore(it.name.value, it.keys, it.primaryKey) }
                 delegate.createStores()
                 opened = true
             }
+        } } catch (error: Throwable) {
+            // A failed partial open remains owned for close; a concurrently closed handle does not.
+            if (mutex.withLock { closed }) releaseRegistration()
+            throw error
+        }
+    }
+    private suspend fun releaseRegistration() = registryMutex.withLock {
+        handles[configuration.identity]?.let { owned ->
+            owned.remove(this)
+            if (owned.isEmpty()) handles.remove(configuration.identity)
         }
     }
     suspend fun <T> transaction(
@@ -284,7 +315,8 @@ class Database(configuration: DatabaseConfiguration, internal val delegate: Life
         }
         try {
             val backend = delegate as? ScopedStoreDelegate ?: throw StoreFailure.InvalidUsage("Scoped transactions are unsupported")
-            withContext(Owner(this@Database)) {
+            val owner = Owner(this@Database, names, mode, true)
+            withContext(owner) {
                 backend.transaction(names, mode) {
                     val scope = TransactionScope(delegate, names, mode, currentCoroutineContext(), configuration.identity, configuration.version)
                     try {
@@ -294,7 +326,7 @@ class Database(configuration: DatabaseConfiguration, internal val delegate: Life
                                 override fun resumeWith(result: Result<T>) = continuation.resumeWith(result)
                             })
                         }
-                        scope.failure?.let { throw StoreFailure.Aborted(it) }
+                        (scope.failure ?: owner.state.failure)?.let { throw StoreFailure.Aborted(it) }
                         value
                     } finally { scope.finish() }
                 }
@@ -309,21 +341,81 @@ class Database(configuration: DatabaseConfiguration, internal val delegate: Life
     suspend fun <T> transaction(lockKey: String, block: suspend () -> T): T = coroutineScope {
         require(lockKey.isNotBlank())
         val backend = delegate as? TransactionalStoreDelegate ?: throw StoreFailure.InvalidUsage()
-        val owner = coroutineContext[Owner]
-        if (owner != null) {
-            if (owner.database !== this@Database || !owner.keyed)
-                throw StoreFailure.InvalidUsage("Keyed transactions can only join keyed transactions on the same handle")
+        val existing = coroutineContext[Owner]
+        if (existing?.database === this@Database) {
+            if (!existing.active || existing.scoped) {
+                val error = StoreFailure.InvalidUsage("Logical transactions cannot escape a restricted scope")
+                existing.state.failure = error
+                throw error
+            }
             return@coroutineScope backend.transaction(lockKey, block)
         }
+        if (existing != null) throw StoreFailure.InvalidUsage("Cannot nest another database transaction")
         val job = coroutineContext[Job] ?: throw StoreFailure.InvalidUsage()
         mutex.withLock {
             if (closed) throw StoreFailure.Closed()
             if (!opened) throw StoreFailure.InvalidUsage("Database must be opened first")
             jobs.add(job)
         }
-        try { withContext(Owner(this@Database, keyed = true)) { backend.transaction(lockKey, block) } }
-        finally { withContext(NonCancellable) { mutex.withLock { jobs.remove(job) } } }
+        val owner = Owner(this@Database, configuration.stores.map { it.name.value }.toSet(), TransactionMode.READ_WRITE, false)
+        try { withContext(owner) {
+            backend.transaction(lockKey) {
+                val value = block()
+                owner.state.failure?.let { throw StoreFailure.Aborted(it) }
+                value
+            }
+        } }
+        finally { owner.active = false; withContext(NonCancellable) { mutex.withLock { jobs.remove(job) } } }
     }
+
+    /**
+     * Bounded indexed work joins this handle's current atomic transaction, or opens a restricted
+     * transaction when called outside one. Calls must be sequential local database work.
+     * A caught access/query failure aborts the owning transaction; parallel helper calls are invalid.
+     */
+    suspend fun query(store: StoreName, query: IndexedQuery): QueryPage {
+        val owner = currentCoroutineContext()[Owner]
+        if (owner == null) return transaction(setOf(store), TransactionMode.READ_ONLY) { validateIndex(store, query); query(store, query) }
+        return indexed(owner, store, query, false) { it.query(store.value, query, configuration.identity, configuration.version) }
+    }
+    suspend fun count(store: StoreName, query: IndexedQuery): Long {
+        val owner = currentCoroutineContext()[Owner]
+        if (owner == null) return transaction(setOf(store), TransactionMode.READ_ONLY) { validateIndex(store, query); count(store, query) }
+        return indexed(owner, store, query, false) {
+            if (query.after != null) throw StoreFailure.InvalidUsage("Counts do not accept continuation")
+            it.count(store.value, query)
+        }
+    }
+    suspend fun deleteBatch(store: StoreName, query: IndexedQuery): Int {
+        val owner = currentCoroutineContext()[Owner]
+        if (owner == null) return transaction(setOf(store)) { validateIndex(store, query); deleteBatch(store, query) }
+        return indexed(owner, store, query, true) { it.deleteBatch(store.value, query, configuration.identity, configuration.version) }
+    }
+    private fun validateIndex(store: StoreName, query: IndexedQuery) {
+        query.validate(configuration.identity, configuration.version, store.value)
+        val declaration = configuration.stores.singleOrNull { it.name == store } ?: throw StoreFailure.InvalidUsage()
+        if (declaration.keys.none { it.name == query.index.name && it::class == query.index::class })
+            throw StoreFailure.InvalidUsage("Index is not declared by this store")
+    }
+    private suspend fun <T> indexed(
+        owner: Owner, store: StoreName, query: IndexedQuery, write: Boolean,
+        block: suspend (IndexedQueryDelegate) -> T,
+    ): T {
+        var locked = false
+        try {
+            if (owner.database !== this || !owner.active || store.value !in owner.stores ||
+                (write && owner.mode == TransactionMode.READ_ONLY)) throw StoreFailure.InvalidUsage("Invalid indexed transaction access")
+            locked = owner.state.gate.tryLock()
+            if (!locked) throw StoreFailure.InvalidUsage("Parallel indexed operations are unsupported")
+            validateIndex(store, query)
+            currentCoroutineContext().ensureActive()
+            return block(delegate as? IndexedQueryDelegate ?: throw StoreFailure.InvalidUsage("Indexed queries are unsupported"))
+        } catch (error: Throwable) {
+            owner.state.failure = error
+            throw error
+        } finally { if (locked) owner.state.gate.unlock() }
+    }
+
 
     suspend fun clearStores(stores: Set<StoreName>) = transaction(stores) { stores.forEach { clear(it) } }
     suspend fun close() {
@@ -340,7 +432,7 @@ class Database(configuration: DatabaseConfiguration, internal val delegate: Life
                 pending.forEach { it.cancel(CancellationException("Database connection closed")) }
                 pending.joinAll()
                 delegate.close()
-                registryMutex.withLock { handles[configuration.identity]?.remove(this@Database) }
+                releaseRegistration()
                 completion.complete(Unit)
             } catch (error: Throwable) { completion.completeExceptionally(error); throw error }
         }
@@ -387,4 +479,5 @@ internal fun DatabaseConfiguration.snapshot(): DatabaseConfiguration = copy(
         StoreDeclaration(declaration.name, keys, keys.single { it.name == declaration.primaryKey.name })
     },
     migrations = migrations.toList(),
+    externalTables = externalTables.toSet(),
 )

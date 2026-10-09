@@ -135,3 +135,20 @@ repository operations in one backend transaction with a process advisory lock.
 Callbacks must do sequential local database work only; no network awaits or child
 coroutines. Same-handle keyed nesting joins the outer transaction; nesting through a restricted scope or another handle is rejected. A caught backend failure remains rollback-only. Handle owners close
 the database after stopping all consumers.
+
+Configured databases reject undeclared tables. Applications sharing one physical
+schema with another owner must explicitly list its optional tables in
+`DatabaseConfiguration.externalTables`. Names are canonical lowercase SQL identifiers
+(up to 63 characters), cannot overlap any owned migration schema, and cannot use
+reserved metadata names. These tables are excluded only from ownership inventory;
+ktstore neither creates them nor includes them in the owned schema fingerprint.
+Unexpected unlisted tables still cause migration/open failure.
+
+Indexed repositories can call `Database.query`, `count`, and `deleteBatch` inside a
+logical-keyed transaction to make admission, bounded reads, and pruning atomic with
+their writes. Outside a transaction each helper opens a restricted transaction.
+Helpers retain the current handle, declared store set, and read-only mode, including
+nested scopes. Perform sequential local database work only: overlapping helper calls
+are rejected, and catching an invalid helper operation does not permit a partial commit.
+Local continuations are tied to database identity, schema version, store and query;
+they are not suitable as public network pagination tokens.
