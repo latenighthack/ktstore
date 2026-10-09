@@ -409,6 +409,7 @@ class IndexDB(
     }
 
     private inner class UpgradeScope(val db: dynamic, val tx: dynamic) : MigrationOperations {
+        override suspend fun storeExists(name: StoreName): Boolean = db.objectStoreNames.contains(name.value) as Boolean
         override suspend fun validateStore(declaration: StoreDeclaration) { validateDeclaration(tx, declaration) }
         override suspend fun createStore(declaration: StoreDeclaration) { createStore(db, Declaration(declaration.name.value, declaration.keys, declaration.primaryKey)) }
         override suspend fun removeStore(name: StoreName) { db.deleteObjectStore(name.value) }

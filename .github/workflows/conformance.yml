@@ -9,6 +9,23 @@ permissions:
 jobs:
   jvm-browser:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: ktstore_test
+          POSTGRES_USER: ktstore
+          POSTGRES_PASSWORD: ktstore
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ktstore -d ktstore_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      KTSTORE_TEST_PG_URL: jdbc:postgresql://localhost:5432/ktstore_test?user=ktstore&password=ktstore
+      KTSTORE_TEST_PG_REQUIRED: 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -19,13 +36,15 @@ jobs:
         with:
           node-version: '22'
       - uses: gradle/actions/setup-gradle@v4
-      - run: ./gradlew :library:jvmTest :migration-tooling:jvmTest :migration-example:verifyStoreMigrations :browser-tests:jsBrowserDevelopmentWebpack --console=plain
+      # PostgreSQL conformance must execute against this job's live service, never cached skips.
+      - run: ./gradlew :library:jvmTest :migration-tooling:jvmTest :migration-example:verifyStoreMigrations :browser-tests:jsBrowserDevelopmentWebpack --no-build-cache --console=plain
       - run: ./gradlew -p migration-gradle-plugin test validatePlugins --console=plain
       - run: npm ci --prefix browser-tests
       - run: browser-tests/node_modules/.bin/playwright install --with-deps chromium firefox webkit
       - name: IndexedDB lifecycle tests
         run: |
-          export CHROME_BIN="$(node -e 'process.stdout.write(require("./browser-tests/node_modules/playwright").chromium.executablePath())')"
+          CHROME_BIN="$(node -e 'process.stdout.write(require("./browser-tests/node_modules/playwright").chromium.executablePath())')"
+          export CHROME_BIN
           ./gradlew :library:jsBrowserTest --console=plain
       - run: npm test --prefix browser-tests
   android:

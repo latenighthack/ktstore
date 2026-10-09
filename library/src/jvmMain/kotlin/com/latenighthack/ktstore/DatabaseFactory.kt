@@ -13,3 +13,7 @@ internal actual fun mapStorageFailure(error: Throwable): Throwable = when {
     }
     else -> error
 }
+
+/** A configured PostgreSQL handle. Schema upgrades are serialized with a database advisory lock. */
+fun createPostgresDatabase(configuration: DatabaseConfiguration, location: String, decorate: (LifecycleStoreDelegate) -> LifecycleStoreDelegate = { it }): Database =
+    Database(configuration, decorate(SqlStoreDelegate(JdbcDriver(location.removePrefix("jdbc:postgresql:"), "postgresql"), "BYTEA", configuration)))

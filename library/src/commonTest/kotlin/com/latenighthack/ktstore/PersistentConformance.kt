@@ -5,6 +5,142 @@ import kotlinx.coroutines.test.runTest
 import kotlin.test.*
 
 abstract class PersistentConformance : DatabaseConformance() {
+    @Test fun definitionAdoptionPreservesOriginalPayloadAndReopens() = runTest { withContext(Dispatchers.Default) {
+        val identity = "adoption-${kotlin.random.Random.nextInt()}"
+        val definition = example.UsersV1
+        val latest = definitionDatabaseConfiguration(identity, listOf(definition))
+        for (version in listOf(1, 2)) {
+            val oldConfig = DatabaseConfiguration("${identity}_$version", version, listOf(definition.declaration))
+            val old = Database(oldConfig, backend(oldConfig))
+            val payload = "01|Alice".encodeToByteArray()
+            old.open()
+            old.transaction(setOf(definition.storeName)) {
+                save(definition.storeName, StoreRow(payload, listOf(definition.id.key.bind(1), definition.name.key.bind("Alice"))))
+            }
+            old.close()
+            val config = latest.copy(identity = oldConfig.identity)
+            var current = Database(config, backend(config))
+            try {
+                current.open()
+                current.transaction(setOf(definition.storeName), TransactionMode.READ_ONLY) {
+                    assertContentEquals(payload, get(definition.storeName, definition.id.eq(1)) as ByteArray)
+                }
+                current.close()
+                current = Database(config, backend(config)); current.open()
+                current.transaction(setOf(definition.storeName), TransactionMode.READ_ONLY) {
+                    assertContentEquals(payload, get(definition.storeName, definition.id.eq(1)) as ByteArray)
+                }
+            } finally { current.deleteDatabase() }
+        }
+    } }
+
+    @Test fun definitionAdoptionCreatesPreviouslyUnregisteredStores() = runTest { withContext(Dispatchers.Default) {
+        val definition = example.UsersV1
+        val extra = object : StoreDefinition<example.UserV1>(StoreName("optional_users"), "user-v1", { example.decodeUserV1(it) }, { example.encodeUserV1(it) }) {
+            val id = integerIndex(IndexName("id"), example.UserV1::id)
+            init { primaryKey(id) }
+        }
+        val config = definitionDatabaseConfiguration("adoption-optional-${kotlin.random.Random.nextInt()}", listOf(definition, extra))
+        val oldConfig = config.copy(version = 2, stores = listOf(definition.declaration), migrations = emptyList())
+        val old = Database(oldConfig, backend(oldConfig)); old.open()
+        old.transaction(setOf(definition.storeName)) { save(definition.storeName, definition.encodeRow(example.UserV1(1, "Alice"))) }
+        old.close()
+        val current = Database(config, backend(config))
+        try {
+            current.open()
+            current.transaction(setOf(definition.storeName, extra.storeName)) {
+                assertEquals(1, getAll(definition.storeName).size)
+                assertTrue(getAll(extra.storeName).isEmpty())
+                save(extra.storeName, extra.encodeRow(example.UserV1(2, "Bob")))
+            }
+        } finally { current.deleteDatabase() }
+    } }
+
+    @Test fun definitionAdoptionRejectsDuplicateDerivedKeysWithoutLosingOldRows() = runTest { withContext(Dispatchers.Default) {
+        val definition = example.UsersV1
+        val config = definitionDatabaseConfiguration("adoption-collision-${kotlin.random.Random.nextInt()}", listOf(definition))
+        val baseline = config.copy(version = 2, migrations = emptyList())
+        val old = Database(baseline, backend(baseline)); old.open()
+        old.transaction(setOf(definition.storeName)) {
+            save(definition.storeName, StoreRow("1|Alice".encodeToByteArray(), listOf(definition.id.key.bind(1), definition.name.key.bind("Alice"))))
+            save(definition.storeName, StoreRow("1|Bob".encodeToByteArray(), listOf(definition.id.key.bind(2), definition.name.key.bind("Bob"))))
+        }
+        old.close()
+        val failed = Database(config, backend(config))
+        try { assertFailsWith<StoreFailure.Migration> { failed.open() } } finally { failed.close() }
+        val reopened = Database(baseline, backend(baseline))
+        try {
+            reopened.open()
+            reopened.transaction(setOf(definition.storeName), TransactionMode.READ_ONLY) {
+                assertEquals(2, getAll(definition.storeName).size)
+                assertContentEquals("1|Bob".encodeToByteArray(), get(definition.storeName, definition.id.eq(2)) as ByteArray)
+            }
+        } finally { reopened.deleteDatabase() }
+    } }
+
+    @Test fun definitionAdoptionRejectsBinaryAndCompositeKeyCollisions() = runTest { withContext(Dispatchers.Default) {
+        data class Identity(val id: ByteArray, val group: Int)
+        for (composite in listOf(false, true)) {
+            val definition = object : StoreDefinition<Identity>(StoreName("binary_records"), "binary-v1",
+                { Identity(byteArrayOf(it.first()), 7) }, { it.id.copyOf() }) {
+                val id = bytesIndex(IndexName("id"), Identity::id, "raw-v1")
+                val group = integerIndex(IndexName("group_id"), Identity::group)
+                val compound = compositeIndex(IndexName("identity"), id, group)
+                init { primaryKey(if (composite) compound else id) }
+            }
+            val latest = definitionDatabaseConfiguration("adoption-binary-${kotlin.random.Random.nextInt()}", listOf(definition))
+            val baseline = latest.copy(version = 2, migrations = emptyList())
+            val old = Database(baseline, backend(baseline)); old.open()
+            val payloads = listOf(byteArrayOf(1, 9), byteArrayOf(1, 10))
+            old.transaction(setOf(definition.storeName)) {
+                payloads.forEachIndexed { offset, payload ->
+                    val keys = definition.encodeRow(Identity(byteArrayOf((offset + 1).toByte()), 7)).keys
+                    save(definition.storeName, StoreRow(payload, keys))
+                }
+            }
+            old.close()
+            val failed = Database(latest, backend(latest))
+            try { assertFailsWith<StoreFailure.Migration> { failed.open() } } finally { failed.close() }
+            val reopened = Database(baseline, backend(baseline))
+            try {
+                reopened.open()
+                reopened.transaction(setOf(definition.storeName), TransactionMode.READ_ONLY) {
+                    val rows = getAll(definition.storeName)
+                    assertEquals(2, rows.size)
+                    payloads.forEach { payload -> assertTrue(rows.any { (it as ByteArray).contentEquals(payload) }) }
+                }
+            } finally { reopened.deleteDatabase() }
+        }
+    } }
+
+    @Test fun definitionAdoptionCorruptionRollsBackOptionalStoresAndVersion() = runTest { withContext(Dispatchers.Default) {
+        val definition = example.UsersV1
+        val optional = object : StoreDefinition<example.UserV1>(StoreName("optional_before_failure"), "user-v1",
+            { example.decodeUserV1(it) }, { example.encodeUserV1(it) }) {
+            val id = integerIndex(IndexName("id"), example.UserV1::id)
+            init { primaryKey(id) }
+        }
+        // Create the optional store before encountering corruption in the next store.
+        val latest = definitionDatabaseConfiguration("adoption-corrupt-${kotlin.random.Random.nextInt()}", listOf(optional, definition))
+        val baseline = latest.copy(version = 2, stores = listOf(definition.declaration), migrations = emptyList())
+        val old = Database(baseline, backend(baseline)); old.open()
+        val payload = "corrupt historical record".encodeToByteArray()
+        old.transaction(setOf(definition.storeName)) {
+            save(definition.storeName, StoreRow(payload, listOf(definition.id.key.bind(1), definition.name.key.bind("Alice"))))
+        }
+        old.close()
+        val failed = Database(latest, backend(latest))
+        try { assertFailsWith<StoreFailure.Migration> { failed.open() } } finally { failed.close() }
+        val reopened = Database(baseline, backend(baseline))
+        try {
+            // Baseline schema validation also proves the optional store was rolled back.
+            reopened.open()
+            reopened.transaction(setOf(definition.storeName), TransactionMode.READ_ONLY) {
+                assertContentEquals(payload, get(definition.storeName, definition.id.eq(1)) as ByteArray)
+            }
+        } finally { reopened.deleteDatabase() }
+    } }
+
     @Test fun generatedMigrationsVerifyHistoricalFixtures() = runTest { withContext(Dispatchers.Default) {
         example.generated.verifyGeneratedStoreMigrations(::backend, "generated-${kotlin.random.Random.nextInt()}")
     } }

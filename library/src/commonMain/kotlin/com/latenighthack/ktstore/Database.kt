@@ -61,6 +61,7 @@ class DatabaseMigration private constructor(
 
 /** Migration callbacks contain database awaits and bounded synchronous transformations only. */
 interface MigrationOperations {
+    suspend fun storeExists(name: StoreName): Boolean = throw StoreFailure.InvalidUsage("Migration store discovery is unsupported")
     suspend fun validateStore(declaration: StoreDeclaration): Unit = throw StoreFailure.InvalidUsage("Typed migrations require schema validation")
     suspend fun createStore(declaration: StoreDeclaration)
     suspend fun removeStore(name: StoreName)
@@ -98,6 +99,7 @@ class MigrationScope internal constructor(private val operations: MigrationOpera
         if (entry.operation == "transform") transformMappedStore(entry.source, entry.target, entry.mapping)
         else rebuildMappedStore(entry.source, entry.target, entry.mapping)
     }
+    suspend fun storeExists(name: StoreName): Boolean = call { operations.storeExists(name) }
     suspend fun createStore(declaration: StoreDeclaration) = call { operations.createStore(declaration) }
     suspend fun removeStore(name: StoreName) = call { operations.removeStore(name) }
     suspend fun addIndex(store: StoreName, key: StoreKey<*>) = call { operations.addIndex(store, key) }
@@ -240,7 +242,7 @@ class Database(configuration: DatabaseConfiguration, internal val delegate: Life
     private var closed = false
     private var closing: CompletableDeferred<Unit>? = null
     private val jobs = mutableSetOf<Job>()
-    private class Owner(val database: Database) : AbstractCoroutineContextElement(Key) {
+    private class Owner(val database: Database, val keyed: Boolean = false) : AbstractCoroutineContextElement(Key) {
         companion object Key : CoroutineContext.Key<Owner>
     }
     companion object {
@@ -299,6 +301,30 @@ class Database(configuration: DatabaseConfiguration, internal val delegate: Life
             }
         } finally { withContext(NonCancellable) { mutex.withLock { jobs.remove(job) } } }
     }
+    /**
+     * Coroutine-scoped atomic writes for repositories that already own typed stores.
+     * The callback must execute sequential local database work; never await network I/O.
+     * The logical lock coordinates PostgreSQL processes, not just this handle.
+     */
+    suspend fun <T> transaction(lockKey: String, block: suspend () -> T): T = coroutineScope {
+        require(lockKey.isNotBlank())
+        val backend = delegate as? TransactionalStoreDelegate ?: throw StoreFailure.InvalidUsage()
+        val owner = coroutineContext[Owner]
+        if (owner != null) {
+            if (owner.database !== this@Database || !owner.keyed)
+                throw StoreFailure.InvalidUsage("Keyed transactions can only join keyed transactions on the same handle")
+            return@coroutineScope backend.transaction(lockKey, block)
+        }
+        val job = coroutineContext[Job] ?: throw StoreFailure.InvalidUsage()
+        mutex.withLock {
+            if (closed) throw StoreFailure.Closed()
+            if (!opened) throw StoreFailure.InvalidUsage("Database must be opened first")
+            jobs.add(job)
+        }
+        try { withContext(Owner(this@Database, keyed = true)) { backend.transaction(lockKey, block) } }
+        finally { withContext(NonCancellable) { mutex.withLock { jobs.remove(job) } } }
+    }
+
     suspend fun clearStores(stores: Set<StoreName>) = transaction(stores) { stores.forEach { clear(it) } }
     suspend fun close() {
         if (coroutineContext[Owner]?.database === this) throw StoreFailure.InvalidUsage("Cannot close inside a transaction")

@@ -75,7 +75,7 @@ pluginManagement {
 
 // build.gradle.kts
 plugins {
-    id("com.latenighthack.ktstore.migrations") version "0.2.0"
+    id("com.latenighthack.ktstore.migrations") version "0.2.1"
 }
 ```
 

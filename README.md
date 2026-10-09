@@ -114,4 +114,24 @@ npm test --prefix browser-tests
 
 The common conformance suite runs against memory, JDBC SQLite, Android SQLite, Apple SQLite, and real IndexedDB. The browser harness runs common conformance and page/worker persistence in Chromium, Firefox, and WebKit. Chromium additionally closes all application pages, delivers a worker event, stops the worker, restarts it, verifies the persisted operation, writes a receipt transactionally, and explicitly reconciles from a reopened page. Native tests run on an Android emulator and iOS simulator; compilation alone is not a runtime gate.
 
-The release workflow depends on conformance. Publication remains separate from local validation; never replace an already published version with different bytes. Consumer repositories and server PostgreSQL persistence are outside this change.
+The release workflow depends on conformance. Publication remains separate from local validation; never replace an already published version with different bytes. Configured PostgreSQL persistence is covered by the JVM conformance gate. Set `KTSTORE_TEST_PG_URL` to an isolated test database; `KTSTORE_TEST_PG_REQUIRED=true` makes a missing URL fail instead of skipping PostgreSQL tests.
+
+## Coordinated legacy definition adoption
+
+`definitionDatabaseConfiguration(identity, definitions)` is the explicit initial
+adoption configuration for unchanged legacy schemas. It advances browser 1 and
+SQL/Android baseline 2 to version 3, reconstructs keys from historical definitions,
+keeps original payload bytes, creates optional previously unregistered stores, and
+rejects duplicate derived primary keys. Keep the supplied V1 codecs and index
+encodings as historical contracts. Future payload/schema changes require new
+versioned definitions and consecutive migration steps.
+
+JVM PostgreSQL hosts use `createPostgresDatabase(configuration, jdbcUrl)`;
+configured opening serializes schema changes with a PostgreSQL advisory lock and
+validates columns, indexes and primary keys. Long columns use BIGINT after adoption.
+The optional lifecycle delegate decorator supports metrics without bypassing the
+configured handle. `Database.transaction(lockKey) { ... }` supports existing typed
+repository operations in one backend transaction with a process advisory lock.
+Callbacks must do sequential local database work only; no network awaits or child
+coroutines. Same-handle keyed nesting joins the outer transaction; nesting through a restricted scope or another handle is rejected. A caught backend failure remains rollback-only. Handle owners close
+the database after stopping all consumers.

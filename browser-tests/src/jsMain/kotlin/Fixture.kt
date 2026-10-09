@@ -54,6 +54,11 @@ fun main() {
             runConformance("binaryCompositeKeysAndAtomicBatches") { tests.binaryCompositeKeysAndAtomicBatches() }
             runConformance("concurrentReadModifyWriteIsSerialized") { tests.concurrentReadModifyWriteIsSerialized() }
             runConformance("definitionBackedStoresShareEncodingAndQueries") { tests.definitionBackedStoresShareEncodingAndQueries() }
+            runConformance("definitionAdoptionPreservesOriginalPayloadAndReopens") { tests.definitionAdoptionPreservesOriginalPayloadAndReopens() }
+            runConformance("definitionAdoptionCreatesPreviouslyUnregisteredStores") { tests.definitionAdoptionCreatesPreviouslyUnregisteredStores() }
+            runConformance("definitionAdoptionRejectsDuplicateDerivedKeysWithoutLosingOldRows") { tests.definitionAdoptionRejectsDuplicateDerivedKeysWithoutLosingOldRows() }
+            runConformance("definitionAdoptionRejectsBinaryAndCompositeKeyCollisions") { tests.definitionAdoptionRejectsBinaryAndCompositeKeyCollisions() }
+            runConformance("definitionAdoptionCorruptionRollsBackOptionalStoresAndVersion") { tests.definitionAdoptionCorruptionRollsBackOptionalStoresAndVersion() }
             runConformance("generatedMigrationsVerifyHistoricalFixtures") { tests.generatedMigrationsVerifyHistoricalFixtures() }
             runConformance("typedMigrationCollisionAndCorruptionRollBack") { tests.typedMigrationCollisionAndCorruptionRollBack() }
             runConformance("typedCreateAndRemoveVerifyEmptyDatabaseSchemas") { tests.typedCreateAndRemoveVerifyEmptyDatabaseSchemas() }
