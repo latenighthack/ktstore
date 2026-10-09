@@ -234,7 +234,10 @@ class IndexDB(
     override suspend fun <T> transaction(block: suspend () -> T): T =
         throw StoreFailure.InvalidUsage("IndexedDB transactions require participating stores")
     override suspend fun <T> transaction(lockKey: String, block: suspend () -> T): T =
-        throw StoreFailure.InvalidUsage("IndexedDB does not support advisory locks")
+        // IndexedDB serializes overlapping read-write transactions across handles/tabs. A logical
+        // owner participates in every declared data store, providing stronger global serialization
+        // than a keyed advisory lock. Existing Tx guards still forbid non-database suspension.
+        transaction(declarations.keys.toSet(), TransactionMode.READ_WRITE, block)
 
     override suspend fun <T> transaction(stores: Set<String>, mode: TransactionMode, block: suspend () -> T): T {
         val current = coroutineContext[Tx]
