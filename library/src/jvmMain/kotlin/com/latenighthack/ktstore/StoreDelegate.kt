@@ -34,17 +34,18 @@ open class BoundQuery(private val connection: Connection, val stmt: PreparedStat
     }
 
     override suspend fun step(): Boolean = withContext(Dispatchers.IO) {
-        if (executed) {
-            return@withContext resultSet!!.next()
+        try {
+            if (executed) return@withContext resultSet!!.next()
+            executed = true
+            if (!stmt.execute()) return@withContext false
+            resultSet = stmt.resultSet
+            resultSet!!.next()
+        } catch (failure: Throwable) {
+            // A canceled SQL wait can finish with a driver timeout exception. Preserve the
+            // caller's cancellation instead of turning it into an application/storage failure.
+            kotlin.coroutines.coroutineContext.ensureActive()
+            throw failure
         }
-
-        executed = true
-        if (!stmt.execute()) {
-            return@withContext false
-        }
-
-        resultSet = stmt.resultSet
-        resultSet!!.next()
     }
 
     // Closes the ResultSet + Statement and returns the connection to the pool. Each guarded so a
@@ -68,7 +69,7 @@ class Select(connection: Connection, stmt: PreparedStatement, closeConnection: B
 // and never closed statements/result sets) with a HikariCP pool: connections are validated, capped,
 // recycled on maxLifetime, and every borrowed connection is returned in finalize()/use{}. This fixes
 // both the statement/ResultSet leak and the "single connection dies -> permanent DB outage" failure.
-class JdbcDriver(private val db: String, private val driver: String) : ManagedSqlDriver {
+class JdbcDriver @JvmOverloads constructor(private val db: String, private val driver: String, private val postgresLimits: PostgresJdbcLimits = PostgresJdbcLimits()) : ManagedSqlDriver {
     private class Transaction(val owner: JdbcDriver, val connection: Connection) : AbstractCoroutineContextElement(Key) {
         var rollbackCause: Throwable? = null
         companion object Key : CoroutineContext.Key<Transaction>
@@ -91,6 +92,7 @@ class JdbcDriver(private val db: String, private val driver: String) : ManagedSq
                     result
                 } catch (error: Throwable) {
                     withContext(NonCancellable) { runCatching { connection.rollback() }.exceptionOrNull()?.let { error.addSuppressed(it) } }
+                    kotlinx.coroutines.currentCoroutineContext().ensureActive()
                     throw error
                 } finally { connection.autoCommit = true }
             }
@@ -117,7 +119,8 @@ class JdbcDriver(private val db: String, private val driver: String) : ManagedSq
     }
 
     private val dataSource: HikariDataSource = HikariDataSource(HikariConfig().apply {
-        jdbcUrl = "jdbc:$driver:$db"
+        jdbcUrl = if (driver == "postgresql") postgresLimits.boundedUrl("jdbc:$driver:$db") else "jdbc:$driver:$db"
+        if (driver == "postgresql") connectionInitSql = postgresLimits.initializationSql
         if (driver == "sqlite") { addDataSourceProperty("transaction_mode", "IMMEDIATE"); addDataSourceProperty("busy_timeout", "5000") }
         poolName = "ktstore-$driver"
         maximumPoolSize = intProp("ktstore.pool.maxSize", 10)
