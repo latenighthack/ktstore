@@ -1,6 +1,5 @@
 package com.latenighthack.ktstore
 
-import com.latenighthack.ktstore.collection.LazyMapList
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -359,9 +358,7 @@ public open class Store<ValueType>(
         val dataList = delegate.getAll(tableName, query)
 
         return if (delegate.isSerialized) {
-            LazyMapList(dataList) {
-                decodeData(it)
-            }
+            dataList.map { decodeData(it) }
         } else {
             @Suppress("UNCHECKED_CAST")
             dataList as List<ValueType>

@@ -141,6 +141,23 @@ abstract class PersistentConformance : DatabaseConformance() {
         } finally { reopened.deleteDatabase() }
     } }
 
+    @Test fun storeGetAllDecodesCorruptRowsAtTheRead() = runTest { withContext(Dispatchers.Default) {
+        val config = example.UsersHistory.v2.configuration("get-all-corrupt-${kotlin.random.Random.nextInt()}")
+        val db = Database(config, backend(config))
+        val users = UserListStore(db)
+        try {
+            users.prepare()
+            db.open()
+            db.transaction(setOf(example.UsersV2.storeName)) {
+                save(users, example.UserV2(1, "Alice", true))
+                save(example.UsersV2.storeName, StoreRow("broken".encodeToByteArray(), listOf(
+                    example.UsersV2.id.key.bind(2), example.UsersV2.name.key.bind("Corrupt"), example.UsersV2.enabled.key.bind(true),
+                )))
+            }
+            assertFailsWith<StoreFailure.CorruptRecord> { users.all() }
+        } finally { db.deleteDatabase() }
+    } }
+
     @Test fun generatedMigrationsVerifyHistoricalFixtures() = runTest { withContext(Dispatchers.Default) {
         example.generated.verifyGeneratedStoreMigrations(::backend, "generated-${kotlin.random.Random.nextInt()}")
     } }

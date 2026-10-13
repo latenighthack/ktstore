@@ -20,4 +20,6 @@ class IndexedDbConformanceTest : PersistentConformance() {
     @Test fun verifyInvalidSourceAndCaughtFailure() = typedMigrationRejectsIncorrectSourceWithoutRunningMapping()
     @Test fun verifyBinaryCompositeCollision() = typedBinaryCompositeCollisionsComparePersistedValues()
     @Test fun verifySchemaCreationRemoval() = typedCreateAndRemoveVerifyEmptyDatabaseSchemas()
+    @Test fun verifyStoreGetAllListContract() = storeGetAllReturnsValueEqualLists()
+    @Test fun verifyStoreGetAllCorruptRead() = storeGetAllDecodesCorruptRowsAtTheRead()
 }

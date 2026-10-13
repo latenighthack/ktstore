@@ -32,6 +32,39 @@ abstract class DatabaseConformance {
         } finally { db.deleteDatabase() }
     } }
 
+    protected class UserListStore(database: Database) : Store<example.UserV2>(database, example.UsersV2) {
+        suspend fun all(): List<example.UserV2> = getAll()
+    }
+
+    @Test fun storeGetAllReturnsValueEqualLists() = runTest { withContext(Dispatchers.Default) {
+        val config = example.UsersHistory.v2.configuration("get-all-list-${kotlin.random.Random.nextInt()}")
+        val db = Database(config, backend(config))
+        val users = UserListStore(db)
+        try {
+            users.prepare()
+            db.open()
+            assertEquals(emptyList(), users.all())
+            val alice = example.UserV2(1, "Alice", true)
+            val bob = example.UserV2(2, "Bob", false)
+            db.transaction(setOf(example.UsersV2.storeName)) { save(users, alice); save(users, bob) }
+            val first = users.all()
+            val second = users.all()
+            assertEquals(first, second)
+            assertEquals(first.hashCode(), second.hashCode())
+            assertTrue(listOf(alice, bob) == first)
+            assertTrue(first == listOf(alice, bob))
+            assertTrue(alice in first)
+            assertTrue(first.containsAll(listOf(bob, alice)))
+            assertFalse(example.UserV2(3, "Carol", true) in first)
+            assertEquals(1, first.indexOf(bob))
+            assertEquals(0, first.lastIndexOf(alice))
+            assertEquals(-1, first.indexOf(example.UserV2(3, "Carol", true)))
+            assertEquals(listOf(alice, bob), first.listIterator().asSequence().toList())
+            assertEquals(bob, first.listIterator(1).next())
+            assertEquals(listOf(bob), first.subList(1, 2))
+        } finally { db.deleteDatabase() }
+    } }
+
     @Test fun wholeReadsUseLogicalPrimaryOrdering() = runTest { withContext(Dispatchers.Default) {
         val longKey = StoreKey.LongKey("id")
         val config = DatabaseConfiguration("ordering-${kotlin.random.Random.nextInt()}", 1, listOf(
