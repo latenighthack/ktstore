@@ -362,7 +362,7 @@ class SqlStoreDelegate(private val driver: SqlDriver, private val blobType: Stri
     }
 
     override suspend fun getMany(tableName: String, relations: List<StoreRelation>): List<Any> =
-        relations.flatMap { getAll(tableName, it) }
+        if (relations.isEmpty()) emptyList() else transaction { relations.flatMap { readAll(tableName, it) } }
 
     private suspend fun queryKeys(table: String, query: IndexedQuery, ordered: Boolean = true): Pair<StoreKey<*>, List<StoreKey<*>>> {
         val declaration = stores.first { it.tableName == table }

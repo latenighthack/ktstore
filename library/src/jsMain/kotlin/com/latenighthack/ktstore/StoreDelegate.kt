@@ -312,6 +312,10 @@ class IndexDB(
         access(tableName, true) { store -> rows.forEach { request(store.put(row(it.data, normalizeKeys(declarations.getValue(tableName).keys, it.keys)))) } }
     }
     override suspend fun get(tableName: String, relation: StoreRelation?): Any? = getAll(tableName, relation).firstOrNull()
+    override suspend fun getMany(tableName: String, relations: List<StoreRelation>): List<Any> {
+        if (relations.isEmpty()) return emptyList()
+        return access(tableName, false) { relations.flatMap { getAll(tableName, it) } }
+    }
     override suspend fun getAll(tableName: String, relation: StoreRelation?): List<Any> = access(tableName, false) { store ->
         val raw = if (relation == null) request(store.getAll()) else request(store.index(indexName(relation.key)).getAll(backend.keyRange.only(value(relation.key))))
         val declaration = declarations.getValue(tableName)

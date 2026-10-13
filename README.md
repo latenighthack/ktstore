@@ -48,6 +48,17 @@ Blocked upgrades/deletions raise `StoreFailure.Blocked`. Browser open/delete req
 
 Native providers supply an absolute, app-owned file location and choose backup exclusions. Android/Apple SQLite use serial background execution, preserve transaction ownership, and default to a five-second busy timeout. SQLite deletion includes auxiliary files after owned connections close. Applications coordinate external processes, tabs, workers, credentials, and non-database caches.
 
+## Read cache
+
+Typed `Store.get` lookups by primary key outside a transaction are cached, and concurrent misses for one store are read together in a single batched `getMany`. Reads inside transactions always reach the database and see the transaction's own writes.
+
+```kotlin
+val db = Database(configuration, delegate, ReadCacheConfiguration(maxEntriesPerStore = 1_000, batchSize = 50))
+val uncached = createDatabase(configuration, location, ReadCacheConfiguration.Disabled)
+```
+
+The defaults are 1,000 least-recently-used rows per store (absent keys included) and batches of up to 50 keys. Handles opened in one process with the same identity share the cache. Every write made through them invalidates it: saves invalidate their primary keys; deletes, clears, indexed batch deletes and migrations invalidate the whole store. Rows written by an open transaction are not cached until it commits or rolls back. The cache assumes every writer is a ktstore handle in the same process. Disable it when another process, browser tab, worker or a bare-delegate `Store` writes the same database. `createPostgresDatabase` disables it by default. In-memory delegates are never cached.
+
 ## Schema and migrations
 
 Database schema version, serialized record format version, and remote resource revision are independent. Payload codecs and domain migrations belong to the application.

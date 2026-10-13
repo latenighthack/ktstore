@@ -98,6 +98,11 @@ open class StoreDefinition<T>(
             throw StoreFailure.CorruptRecord(error)
         }
     }
+    internal fun primaryKeyOf(value: T): BoundStoreKey {
+        declaration
+        val index = requireNotNull(primary)
+        return fields.single { it.index === index }.value(value)
+    }
     fun encodeRow(value: T): StoreRow {
         val schema = declaration
         return StoreRow(encodePayload(value), copyKeys(normalizeKeys(schema.keys, fields.map { it.value(value) })))

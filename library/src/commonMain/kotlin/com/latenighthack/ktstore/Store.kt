@@ -1,6 +1,7 @@
 package com.latenighthack.ktstore
 
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlin.reflect.KFunction1
@@ -103,7 +104,13 @@ public open class Store<ValueType>(
     private val reader: KFunction1<ByteArray, ValueType>
 ) {
     constructor(database: Database, name: StoreName, writer: KFunction1<ValueType, ByteArray>, reader: KFunction1<ByteArray, ValueType>) :
-        this(database.delegate, name.value, writer, reader)
+        this(database.delegate, name.value, writer, reader) {
+        this.database = database
+    }
+
+    /** Stores built from a bare delegate neither use nor invalidate a read cache. */
+    private var database: Database? = null
+    private val batches = ReadBatcher()
 
     private var definition: StoreDefinition<ValueType>? = null
     constructor(database: Database, definition: StoreDefinition<ValueType>) :
@@ -371,7 +378,10 @@ public open class Store<ValueType>(
         }
 
     protected suspend fun get(query: StoreRelation? = null): ValueType? {
-        val data = delegate.get(tableName, query)
+        val loaded = cachedGet(query)
+        @Suppress("UNCHECKED_CAST")
+        if (loaded?.decoded == true) return loaded.value as ValueType?
+        val data = if (loaded != null) loaded.data else delegate.get(tableName, query)
 
         return if (delegate.isSerialized) {
             data?.let { decodeData(it) }
@@ -381,22 +391,85 @@ public open class Store<ValueType>(
         }
     }
 
+    /** Primary-key lookups outside transactions; null when the read must go to the delegate directly. */
+    private suspend fun cachedGet(query: StoreRelation?): ReadBatcher.Loaded? {
+        val database = database ?: return null
+        val cache = database.readCache ?: return null
+        val settings = database.readCacheConfiguration
+        if (query !is StoreRelation.Eq || settings == ReadCacheConfiguration.Disabled) return null
+        if (currentCoroutineContext()[Database.Owner] != null) return null
+        val primary = database.configuration.stores.singleOrNull { it.name.value == tableName }?.primaryKey ?: return null
+        val key = query.key
+        if (key.name != primary.name) return null
+        val cacheKey = key.toAny()
+        return when (val lookup = cache.lookup(tableName, cacheKey)) {
+            is SharedReadCache.Lookup.Hit -> ReadBatcher.Loaded(lookup.data, null, false)
+            SharedReadCache.Lookup.Bypass -> null
+            SharedReadCache.Lookup.Miss -> batches.load(cacheKey, query, settings.batchSize) { requests ->
+                loadBatch(cache, settings, requests)
+            }
+        }
+    }
+
+    /** Completes every request; failures are reported to the requests they affect. */
+    private suspend fun loadBatch(cache: SharedReadCache, settings: ReadCacheConfiguration, requests: Map<Any?, ReadBatcher.Request>) {
+        try {
+            val generation = cache.generation(tableName)
+            val found = mutableMapOf<Any?, ReadBatcher.Loaded>()
+            var unattributed = false
+            for (data in delegate.getMany(tableName, requests.values.map { it.relation })) {
+                val value = try { decodeData(data) } catch (_: Exception) { unattributed = true; continue }
+                val key = primaryKeyOf(value)
+                if (key in requests && key !in found) found[key] = ReadBatcher.Loaded(data, value, true) else unattributed = true
+            }
+            // Rows whose decoded value does not reproduce the requested key are read individually,
+            // so a corrupt or non-canonical row only affects its own caller.
+            val failures = mutableMapOf<Any?, Throwable>()
+            if (unattributed) requests.forEach { (key, request) ->
+                if (key !in found) try {
+                    found[key] = ReadBatcher.Loaded(delegate.get(tableName, request.relation), null, false)
+                } catch (error: Throwable) { failures[key] = error }
+            }
+            cache.store(tableName, generation, requests.keys.filter { it !in failures }.associateWith { found[it]?.data }, settings.maxEntriesPerStore)
+            requests.forEach { (key, request) ->
+                val failure = failures[key]
+                if (failure != null) request.result.completeExceptionally(failure)
+                else request.result.complete(found[key] ?: ReadBatcher.Loaded(null, null, true))
+            }
+        } catch (error: Throwable) {
+            requests.values.forEach { it.result.completeExceptionally(error) }
+        }
+    }
+
+    private fun primaryKeyOf(value: ValueType): Any? {
+        definition?.let { return it.primaryKeyOf(value).toAny() }
+        val index = primaryKeyIndex ?: return Unattributed
+        return index.key.bind(index.accessor(value)).toAny()
+    }
+    private object Unattributed
+
+    private suspend fun <T> writing(rows: List<StoreRow>?, block: suspend () -> T): T {
+        val database = database ?: return block()
+        return database.writing(tableName, rows, block)
+    }
+
     protected suspend fun delete(query: StoreRelation) {
-        delegate.delete(tableName, query)
+        writing(null) { delegate.delete(tableName, query) }
     }
 
     protected suspend fun deleteAll() {
-        delegate.deleteAll(tableName)
+        writing(null) { delegate.deleteAll(tableName) }
     }
 
     protected suspend fun saveAll(values: List<ValueType>) {
-        delegate.saveAll(tableName, values.map(::encodeRow))
+        val rows = values.map(::encodeRow)
+        writing(rows) { delegate.saveAll(tableName, rows) }
     }
 
-    protected suspend fun deleteMany(relations: List<StoreRelation>) = delegate.deleteMany(tableName, relations)
+    protected suspend fun deleteMany(relations: List<StoreRelation>) = writing(null) { delegate.deleteMany(tableName, relations) }
 
     protected suspend fun save(value: ValueType) {
         val row = encodeRow(value)
-        delegate.save(tableName, row.data, row.keys)
+        writing(listOf(row)) { delegate.save(tableName, row.data, row.keys) }
     }
 }

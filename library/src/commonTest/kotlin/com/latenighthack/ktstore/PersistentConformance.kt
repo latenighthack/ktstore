@@ -158,6 +158,144 @@ abstract class PersistentConformance : DatabaseConformance() {
         } finally { db.deleteDatabase() }
     } }
 
+    private suspend fun <T> cachedUsers(
+        cache: ReadCacheConfiguration,
+        block: suspend (db: Database, users: UserListStore, counts: CountingDelegate, config: DatabaseConfiguration) -> T,
+    ): T {
+        val config = example.UsersHistory.v2.configuration("read-cache-${kotlin.random.Random.nextInt()}")
+        val counts = CountingDelegate(backend(config))
+        val db = Database(config, counts, cache)
+        val users = UserListStore(db)
+        try {
+            users.prepare()
+            db.open()
+            db.transaction(setOf(example.UsersV2.storeName)) { (1..10).forEach { save(users, example.UserV2(it, "User$it", true)) } }
+            return block(db, users, counts, config)
+        } finally { db.deleteDatabase() }
+    }
+    // One thread makes coalescing deterministic: every lookup is queued before the first batch reads.
+    private suspend fun findConcurrently(users: UserListStore, ids: List<Int>) = withContext(Dispatchers.Default.limitedParallelism(1)) {
+        ids.map { async { users.find(it) } }.awaitAll()
+    }
+
+    @Test fun storeGetBatchesConcurrentMissesAndCachesResults() = runTest { withContext(Dispatchers.Default) {
+        cachedUsers(ReadCacheConfiguration(maxEntriesPerStore = 100, batchSize = 4)) { _, users, counts, _ ->
+            val ids = (1..11).toList()
+            val expected = ids.map { id -> if (id <= 10) example.UserV2(id, "User$id", true) else null }
+            assertEquals(expected, findConcurrently(users, ids))
+            assertEquals(listOf(4, 4, 3), counts.batches)
+            assertEquals(0, counts.gets)
+            assertEquals(expected, findConcurrently(users, ids))
+            assertEquals(expected, ids.map { users.find(it) })
+            assertEquals(listOf(4, 4, 3), counts.batches, "hits and cached absences do not reach the delegate")
+        }
+    } }
+
+    @Test fun storeGetCacheEvictsLeastRecentlyUsedEntries() = runTest { withContext(Dispatchers.Default) {
+        cachedUsers(ReadCacheConfiguration(maxEntriesPerStore = 2, batchSize = 8)) { _, users, counts, _ ->
+            users.find(1); users.find(2); users.find(1); users.find(3)
+            assertEquals(3, counts.batches.size)
+            users.find(1)
+            assertEquals(3, counts.batches.size)
+            users.find(2)
+            assertEquals(4, counts.batches.size)
+        }
+    } }
+
+    @Test fun storeGetCacheIsInvalidatedByEveryWritePath() = runTest { withContext(Dispatchers.Default) {
+        cachedUsers(ReadCacheConfiguration()) { db, users, counts, _ ->
+            val name = example.UsersV2.storeName
+            findConcurrently(users, (1..10).toList())
+            fun reads() = counts.batches.size + counts.gets
+
+            users.put(example.UserV2(1, "Store save", true))
+            var before = reads()
+            assertEquals("Store save", users.find(1)?.name)
+            assertEquals("User2", users.find(2)?.name)
+            assertEquals(before + 1, reads(), "a save invalidates only its own key")
+
+            db.transaction(setOf(name)) { save(name, example.UsersV2.encodeRow(example.UserV2(2, "Raw row", true))) }
+            assertEquals("Raw row", users.find(2)?.name)
+            db.transaction(setOf(name)) { save(users, example.UserV2(3, "Scoped save", true)) }
+            assertEquals("Scoped save", users.find(3)?.name)
+            db.transaction(setOf(name)) { saveAll(users, listOf(example.UserV2(4, "Scoped saveAll", true))) }
+            assertEquals("Scoped saveAll", users.find(4)?.name)
+            users.remove(5)
+            assertNull(users.find(5))
+            db.transaction(setOf(name)) { delete(name, example.UsersV2.id.eq(6)) }
+            assertNull(users.find(6))
+            db.transaction("logical") { users.put(example.UserV2(7, "Logical", true)) }
+            assertEquals("Logical", users.find(7)?.name)
+
+            findConcurrently(users, (1..10).toList())
+            before = reads()
+            db.clearStores(setOf(name))
+            assertEquals(List(10) { null }, findConcurrently(users, (1..10).toList()))
+            assertTrue(reads() > before)
+        }
+    } }
+
+    @Test fun storeGetCacheNeverKeepsUncommittedWrites() = runTest { withContext(Dispatchers.Default) {
+        cachedUsers(ReadCacheConfiguration()) { db, users, _, _ ->
+            val original = example.UserV2(1, "User1", true)
+            assertEquals(original, users.find(1))
+            assertFailsWith<IllegalStateException> {
+                db.transaction("rollback") {
+                    users.put(example.UserV2(1, "Uncommitted", true))
+                    assertEquals("Uncommitted", users.find(1)?.name, "transactions read their own writes")
+                    error("roll back")
+                }
+            }
+            assertEquals(original, users.find(1))
+            assertFails {
+                db.transaction(setOf(example.UsersV2.storeName)) {
+                    save(users, example.UserV2(1, "Uncommitted", true))
+                    error("roll back")
+                }
+            }
+            assertEquals(original, users.find(1))
+        }
+    } }
+
+    @Test fun storeGetCacheIsSharedAcrossHandlesOfOneDatabase() = runTest { withContext(Dispatchers.Default) {
+        cachedUsers(ReadCacheConfiguration()) { _, users, _, config ->
+            assertEquals("User1", users.find(1)?.name)
+            val other = Database(config, backend(config))
+            val otherUsers = UserListStore(other)
+            try {
+                otherUsers.prepare()
+                other.open()
+                otherUsers.put(example.UserV2(1, "Other handle", true))
+                assertEquals("Other handle", users.find(1)?.name)
+            } finally { other.close() }
+        }
+    } }
+
+    @Test fun storeGetBatchIsolatesCorruptRows() = runTest { withContext(Dispatchers.Default) {
+        cachedUsers(ReadCacheConfiguration()) { db, users, _, _ ->
+            db.transaction(setOf(example.UsersV2.storeName)) {
+                save(example.UsersV2.storeName, StoreRow("broken".encodeToByteArray(), listOf(
+                    example.UsersV2.id.key.bind(2), example.UsersV2.name.key.bind("Corrupt"), example.UsersV2.enabled.key.bind(true),
+                )))
+            }
+            val results = withContext(Dispatchers.Default.limitedParallelism(1)) {
+                listOf(1, 2, 3).map { async { runCatching { users.find(it) } } }.awaitAll()
+            }
+            assertEquals("User1", results[0].getOrThrow()?.name)
+            assertIs<StoreFailure.CorruptRecord>(results[1].exceptionOrNull())
+            assertEquals("User3", results[2].getOrThrow()?.name)
+        }
+    } }
+
+    @Test fun storeGetCacheCanBeDisabled() = runTest { withContext(Dispatchers.Default) {
+        cachedUsers(ReadCacheConfiguration.Disabled) { _, users, counts, _ ->
+            findConcurrently(users, listOf(1, 2, 3))
+            users.find(1)
+            assertEquals(4, counts.gets)
+            assertTrue(counts.batches.isEmpty())
+        }
+    } }
+
     @Test fun generatedMigrationsVerifyHistoricalFixtures() = runTest { withContext(Dispatchers.Default) {
         example.generated.verifyGeneratedStoreMigrations(::backend, "generated-${kotlin.random.Random.nextInt()}")
     } }

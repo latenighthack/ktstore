@@ -14,6 +14,15 @@ internal actual fun mapStorageFailure(error: Throwable): Throwable = when {
     else -> error
 }
 
-/** A configured PostgreSQL handle. Schema upgrades are serialized with a database advisory lock. */
+/**
+ * A configured PostgreSQL handle. Schema upgrades are serialized with a database advisory lock.
+ * Other processes may write the same database, so the local read cache is disabled by default.
+ */
 fun createPostgresDatabase(configuration: DatabaseConfiguration, location: String, decorate: (LifecycleStoreDelegate) -> LifecycleStoreDelegate = { it }): Database =
-    Database(configuration, decorate(SqlStoreDelegate(JdbcDriver(location.removePrefix("jdbc:postgresql:"), "postgresql"), "BYTEA", configuration)))
+    createPostgresDatabase(configuration, location, ReadCacheConfiguration.Disabled, decorate)
+
+fun createPostgresDatabase(
+    configuration: DatabaseConfiguration, location: String, readCache: ReadCacheConfiguration,
+    decorate: (LifecycleStoreDelegate) -> LifecycleStoreDelegate = { it },
+): Database =
+    Database(configuration, decorate(SqlStoreDelegate(JdbcDriver(location.removePrefix("jdbc:postgresql:"), "postgresql"), "BYTEA", configuration)), readCache)

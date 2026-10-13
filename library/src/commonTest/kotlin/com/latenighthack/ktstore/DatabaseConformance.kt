@@ -34,6 +34,9 @@ abstract class DatabaseConformance {
 
     protected class UserListStore(database: Database) : Store<example.UserV2>(database, example.UsersV2) {
         suspend fun all(): List<example.UserV2> = getAll()
+        suspend fun find(id: Int): example.UserV2? = get(example.UsersV2.id.eq(id))
+        suspend fun put(value: example.UserV2) = save(value)
+        suspend fun remove(id: Int) = delete(example.UsersV2.id.eq(id))
     }
 
     @Test fun storeGetAllReturnsValueEqualLists() = runTest { withContext(Dispatchers.Default) {

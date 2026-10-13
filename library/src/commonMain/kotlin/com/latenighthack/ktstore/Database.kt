@@ -170,12 +170,17 @@ class TransactionScope internal constructor(
             COROUTINE_SUSPENDED
         }
 
+    /** Invalidates cached reads of rows this transaction writes; [rows] null means unknown rows. */
+    private fun written(store: String, rows: List<StoreRow>?) {
+        context[Database.Owner]?.let { it.database.joinWrite(it.state, store, rows) }
+    }
+
     suspend fun get(store: StoreName, relation: StoreRelation? = null): Any? = operation(store) { delegate.get(store.value, relation) }
     suspend fun getAll(store: StoreName, relation: StoreRelation? = null): List<Any> = operation(store) { delegate.getAll(store.value, relation) }
-    suspend fun save(store: StoreName, row: StoreRow) = operation(store, true) { delegate.save(store.value, row.data, row.keys) }
-    suspend fun saveAll(store: StoreName, rows: List<StoreRow>) = operation(store, true) { delegate.saveAll(store.value, rows) }
-    suspend fun delete(store: StoreName, relation: StoreRelation) = operation(store, true) { delegate.delete(store.value, relation) }
-    suspend fun clear(store: StoreName) = operation(store, true) { delegate.deleteAll(store.value) }
+    suspend fun save(store: StoreName, row: StoreRow) = operation(store, true) { written(store.value, listOf(row)); delegate.save(store.value, row.data, row.keys) }
+    suspend fun saveAll(store: StoreName, rows: List<StoreRow>) = operation(store, true) { written(store.value, rows); delegate.saveAll(store.value, rows) }
+    suspend fun delete(store: StoreName, relation: StoreRelation) = operation(store, true) { written(store.value, null); delegate.delete(store.value, relation) }
+    suspend fun clear(store: StoreName) = operation(store, true) { written(store.value, null); delegate.deleteAll(store.value) }
 
     private fun checkStore(store: Store<*>) {
         if (store.delegate !== delegate) {
@@ -193,13 +198,13 @@ class TransactionScope internal constructor(
         delegate.getAll(store.tableName, relation).map { store.decodeData(it) }
     }
     suspend fun <T> save(store: Store<T>, value: T) = operation(StoreName(store.tableName), true) {
-        checkStore(store); val row = store.encodeRow(value); delegate.save(store.tableName, row.data, row.keys)
+        checkStore(store); val row = store.encodeRow(value); written(store.tableName, listOf(row)); delegate.save(store.tableName, row.data, row.keys)
     }
     suspend fun <T> saveAll(store: Store<T>, values: List<T>) = operation(StoreName(store.tableName), true) {
-        checkStore(store); delegate.saveAll(store.tableName, values.map { store.encodeRow(it) })
+        checkStore(store); val rows = values.map { store.encodeRow(it) }; written(store.tableName, rows); delegate.saveAll(store.tableName, rows)
     }
     suspend fun delete(store: Store<*>, relation: StoreRelation) = operation(StoreName(store.tableName), true) {
-        checkStore(store); delegate.delete(store.tableName, relation)
+        checkStore(store); written(store.tableName, null); delegate.delete(store.tableName, relation)
     }
 
     suspend fun query(store: StoreName, query: IndexedQuery): QueryPage = operation(store) {
@@ -213,6 +218,7 @@ class TransactionScope internal constructor(
     }
     suspend fun deleteBatch(store: StoreName, query: IndexedQuery): Int = operation(store, true) {
         query.validate(identity, version, store.value)
+        written(store.value, null)
         (delegate as? IndexedQueryDelegate ?: throw StoreFailure.InvalidUsage()).deleteBatch(store.value, query, identity, version)
     }
 
@@ -246,8 +252,16 @@ class TransactionScope internal constructor(
 }
 
 /** New handles own one delegate; closing never reactivates an old handle. */
-class Database(configuration: DatabaseConfiguration, internal val delegate: LifecycleStoreDelegate) {
+class Database(
+    configuration: DatabaseConfiguration,
+    internal val delegate: LifecycleStoreDelegate,
+    val readCacheConfiguration: ReadCacheConfiguration,
+) {
+    constructor(configuration: DatabaseConfiguration, delegate: LifecycleStoreDelegate) :
+        this(configuration, delegate, ReadCacheConfiguration())
     val configuration = configuration.snapshot()
+    /** Shared by open handles with this identity; absent before open, after close, and for in-memory delegates. */
+    @kotlin.concurrent.Volatile internal var readCache: SharedReadCache? = null
     private val mutex = Mutex()
     private var opened = false
     private var closed = false
@@ -256,6 +270,8 @@ class Database(configuration: DatabaseConfiguration, internal val delegate: Life
     internal class AccessState {
         val gate = Mutex()
         var failure: Throwable? = null
+        val written = mutableSetOf<String>()
+        var cache: SharedReadCache? = null
     }
     internal class Owner(
         val database: Database, val stores: Set<String>, val mode: TransactionMode,
@@ -269,13 +285,18 @@ class Database(configuration: DatabaseConfiguration, internal val delegate: Life
         private val registryMutex = Mutex()
         private val handles = mutableMapOf<String, MutableSet<Database>>()
         private val deletions = mutableMapOf<String, CompletableDeferred<Unit>>()
+        private val readCaches = mutableMapOf<String, SharedReadCache>()
     }
     suspend fun open() {
         mutex.withLock { if (closed) throw StoreFailure.Closed() }
         while (true) {
             val deletion = registryMutex.withLock {
                 val pending = deletions[configuration.identity]
-                if (pending == null) handles.getOrPut(configuration.identity) { mutableSetOf() }.add(this)
+                if (pending == null) {
+                    handles.getOrPut(configuration.identity) { mutableSetOf() }.add(this)
+                    // Non-serialized delegates hold per-handle data, so a shared cache could mix handles.
+                    if (delegate.isSerialized) readCache = readCaches.getOrPut(configuration.identity) { SharedReadCache() }
+                }
                 pending
             }
             if (deletion == null) break
@@ -284,8 +305,12 @@ class Database(configuration: DatabaseConfiguration, internal val delegate: Life
         try { mutex.withLock {
             if (closed) throw StoreFailure.Closed()
             if (!opened) {
-                configuration.stores.forEach { delegate.registerStore(it.name.value, it.keys, it.primaryKey) }
-                delegate.createStores()
+                val cache = readCache
+                cache?.beginExclusive()
+                try {
+                    configuration.stores.forEach { delegate.registerStore(it.name.value, it.keys, it.primaryKey) }
+                    delegate.createStores()
+                } finally { cache?.endExclusive() }
                 opened = true
             }
         } } catch (error: Throwable) {
@@ -295,10 +320,36 @@ class Database(configuration: DatabaseConfiguration, internal val delegate: Life
         }
     }
     private suspend fun releaseRegistration() = registryMutex.withLock {
+        readCache = null
         handles[configuration.identity]?.let { owned ->
             owned.remove(this)
-            if (owned.isEmpty()) handles.remove(configuration.identity)
+            if (owned.isEmpty()) { handles.remove(configuration.identity); readCaches.remove(configuration.identity) }
         }
+    }
+
+    /** Primary-key cache keys of written rows, or null to invalidate the whole table. */
+    private fun cacheKeys(table: String, rows: List<StoreRow>?): Collection<Any?>? {
+        val declaration = configuration.stores.singleOrNull { it.name.value == table } ?: return null
+        return try {
+            rows?.map { row -> normalizeKeys(declaration.keys, row.keys).single { it.name == declaration.primaryKey.name }.toAny() }
+        } catch (_: Exception) { null }
+    }
+    internal fun joinWrite(state: AccessState, table: String, rows: List<StoreRow>?) {
+        val cache = readCache ?: return
+        state.cache = cache
+        cache.joinWrite(state.written, table, cacheKeys(table, rows))
+    }
+    private fun endWrites(state: AccessState) { state.cache?.endWrites(state.written) }
+    /** Writes outside a transaction of this handle commit individually; inside one they end with it. */
+    internal suspend fun <T> writing(table: String, rows: List<StoreRow>?, block: suspend () -> T): T {
+        val cache = readCache ?: return block()
+        val owner = currentCoroutineContext()[Owner]?.takeIf { it.database === this }
+        if (owner != null) {
+            joinWrite(owner.state, table, rows)
+            return block()
+        }
+        cache.beginWrite(table, cacheKeys(table, rows))
+        try { return block() } finally { cache.endWrite(table) }
     }
     suspend fun <T> transaction(
         stores: Set<StoreName>, mode: TransactionMode = TransactionMode.READ_WRITE,
@@ -313,9 +364,9 @@ class Database(configuration: DatabaseConfiguration, internal val delegate: Life
             if (names.isEmpty() || !configuration.stores.map { it.name.value }.containsAll(names)) throw StoreFailure.InvalidUsage()
             jobs.add(job)
         }
+        val owner = Owner(this@Database, names, mode, true)
         try {
             val backend = delegate as? ScopedStoreDelegate ?: throw StoreFailure.InvalidUsage("Scoped transactions are unsupported")
-            val owner = Owner(this@Database, names, mode, true)
             withContext(owner) {
                 backend.transaction(names, mode) {
                     val scope = TransactionScope(delegate, names, mode, currentCoroutineContext(), configuration.identity, configuration.version)
@@ -331,7 +382,7 @@ class Database(configuration: DatabaseConfiguration, internal val delegate: Life
                     } finally { scope.finish() }
                 }
             }
-        } finally { withContext(NonCancellable) { mutex.withLock { jobs.remove(job) } } }
+        } finally { endWrites(owner.state); withContext(NonCancellable) { mutex.withLock { jobs.remove(job) } } }
     }
     /**
      * Coroutine-scoped atomic writes for repositories that already own typed stores.
@@ -365,7 +416,7 @@ class Database(configuration: DatabaseConfiguration, internal val delegate: Life
                 value
             }
         } }
-        finally { owner.active = false; withContext(NonCancellable) { mutex.withLock { jobs.remove(job) } } }
+        finally { owner.active = false; endWrites(owner.state); withContext(NonCancellable) { mutex.withLock { jobs.remove(job) } } }
     }
 
     /**
@@ -409,6 +460,7 @@ class Database(configuration: DatabaseConfiguration, internal val delegate: Life
             if (!locked) throw StoreFailure.InvalidUsage("Parallel indexed operations are unsupported")
             validateIndex(store, query)
             currentCoroutineContext().ensureActive()
+            if (write) joinWrite(owner.state, store.value, null)
             return block(delegate as? IndexedQueryDelegate ?: throw StoreFailure.InvalidUsage("Indexed queries are unsupported"))
         } catch (error: Throwable) {
             owner.state.failure = error
@@ -457,6 +509,9 @@ class Database(configuration: DatabaseConfiguration, internal val delegate: Life
 
 /** Native callers provide an absolute app-owned SQLite file location. */
 expect fun createDatabase(configuration: DatabaseConfiguration, location: String? = null): Database
+
+fun createDatabase(configuration: DatabaseConfiguration, location: String?, readCache: ReadCacheConfiguration): Database =
+    createDatabase(configuration, location).let { Database(it.configuration, it.delegate, readCache) }
 
 internal fun DatabaseConfiguration.fingerprint(): String = stores.sortedBy { it.name.value }.joinToString(";") { store ->
     store.name.value + ":" + store.primaryKey.name + ":" + store.keys.sortedBy { it.name }.joinToString(",") { key ->

@@ -22,4 +22,11 @@ class IndexedDbConformanceTest : PersistentConformance() {
     @Test fun verifySchemaCreationRemoval() = typedCreateAndRemoveVerifyEmptyDatabaseSchemas()
     @Test fun verifyStoreGetAllListContract() = storeGetAllReturnsValueEqualLists()
     @Test fun verifyStoreGetAllCorruptRead() = storeGetAllDecodesCorruptRowsAtTheRead()
+    @Test fun verifyReadCacheBatching() = storeGetBatchesConcurrentMissesAndCachesResults()
+    @Test fun verifyReadCacheEviction() = storeGetCacheEvictsLeastRecentlyUsedEntries()
+    @Test fun verifyReadCacheInvalidation() = storeGetCacheIsInvalidatedByEveryWritePath()
+    @Test fun verifyReadCacheRollback() = storeGetCacheNeverKeepsUncommittedWrites()
+    @Test fun verifyReadCacheSharedHandles() = storeGetCacheIsSharedAcrossHandlesOfOneDatabase()
+    @Test fun verifyReadCacheCorruptBatch() = storeGetBatchIsolatesCorruptRows()
+    @Test fun verifyReadCacheDisabled() = storeGetCacheCanBeDisabled()
 }
