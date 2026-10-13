@@ -232,7 +232,11 @@ public open class Store<ValueType>(
         if (!owner) { pending.await(); return }
         try {
             val declaration = definition?.declaration
-            delegate.registerStore(tableName, declaration?.keys ?: indices.map { it.key }, declaration?.primaryKey ?: primaryKeyIndex?.key)
+            // Database.open() already registered definition-backed stores. Re-registering here
+            // mutates the delegate's table descriptors while other stores may be reading them.
+            if (declaration == null) {
+                delegate.registerStore(tableName, indices.map { it.key }, primaryKeyIndex?.key)
+            }
             pending.complete(Unit)
         } catch (error: Throwable) {
             pending.completeExceptionally(error)

@@ -1,6 +1,7 @@
 package com.latenighthack.ktstore
 
 import example.*
+import kotlinx.coroutines.test.runTest
 import kotlin.test.*
 
 class StoreDefinitionTest {
@@ -37,6 +38,23 @@ class StoreDefinitionTest {
         }
         val mismatch = Database(UsersHistory.v1.configuration("old"), InMemoryStoreDelegate())
         assertFailsWith<IllegalArgumentException> { UsersStore(mismatch) }
+    }
+    @Test fun definitionBackedPreparationDoesNotReregisterOpenDatabase() = runTest {
+        val backend = InMemoryStoreDelegate()
+        var registrations = 0
+        val delegate = object : LifecycleStoreDelegate by backend {
+            override suspend fun registerStore(tableName: String, keys: List<StoreKey<*>>, primaryKey: StoreKey<*>?) {
+                registrations++
+                backend.registerStore(tableName, keys, primaryKey)
+            }
+        }
+        val database = Database(UsersHistory.v2.configuration("definition-preparation"), delegate)
+        val store = UsersStore(database)
+        database.open()
+        val afterOpen = registrations
+        assertTrue(afterOpen > 0)
+        store.prepare()
+        assertEquals(afterOpen, registrations)
     }
     @Test fun catalogsRequireExplicitChangesAndConsecutiveSteps() {
         assertFailsWith<IllegalArgumentException> { MigrationTransition(UsersHistory.v1, UsersHistory.v2, emptyList()) }
