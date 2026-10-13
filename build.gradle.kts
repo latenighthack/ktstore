@@ -14,7 +14,7 @@ plugins {
 
 allprojects {
     group = "com.latenighthack.ktstore"
-    version = "0.2.4"
+    version = "0.2.5"
 
     repositories {
         mavenCentral()
