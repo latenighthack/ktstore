@@ -1,5 +1,6 @@
 package com.latenighthack.ktstore
 
+import com.latenighthack.ktstore.collection.LazyMapList
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.sync.Mutex
@@ -70,6 +71,10 @@ public interface StoreDelegate {
     suspend fun getMany(tableName: String, relations: List<StoreRelation>): List<Any> =
         relations.flatMap { getAll(tableName, it) }
 
+    /** Preserves relation groups, including empty matches, without decoding payloads. */
+    suspend fun getManyGrouped(tableName: String, relations: List<StoreRelation>): List<List<Any>> =
+        relations.map { getAll(tableName, it) }
+
     suspend fun saveAll(tableName: String, rows: List<StoreRow>) {
         rows.forEach { save(tableName, it.data, it.keys) }
     }
@@ -110,7 +115,6 @@ public open class Store<ValueType>(
 
     /** Stores built from a bare delegate neither use nor invalidate a read cache. */
     private var database: Database? = null
-    private val batches = ReadBatcher()
 
     private var definition: StoreDefinition<ValueType>? = null
     constructor(database: Database, definition: StoreDefinition<ValueType>) :
@@ -365,34 +369,101 @@ public open class Store<ValueType>(
         writer(value)
     }.also { registerIndex(it) }
 
-    protected suspend fun getAll(query: StoreRelation? = null): List<ValueType> {
-        val dataList = delegate.getAll(tableName, query)
+    internal class ReadContext(val database: Database, val cache: SharedReadCache, val generation: Long, val capacity: Int)
+    private data class UncachedRelation(val position: Int)
+    private val codecIdentity: Any get() = definition ?: (writer to reader)
 
-        return if (delegate.isSerialized) {
-            dataList.map { decodeData(it) }
-        } else {
-            @Suppress("UNCHECKED_CAST")
-            dataList as List<ValueType>
+    private suspend fun readContext(): ReadContext? {
+        val database = database ?: return null
+        val cache = database.readCache ?: return null
+        if (database.readCacheConfiguration.maxEntriesPerStore == 0 || currentCoroutineContext()[Database.Owner] != null) return null
+        return ReadContext(database, cache, cache.generation(tableName), database.readCacheConfiguration.maxEntriesPerStore)
+    }
+    private fun primaryQueryKey(query: StoreRelation?): Any? {
+        val primary = database?.configuration?.stores?.singleOrNull { it.name.value == tableName }?.primaryKey ?: return null
+        if (query !is StoreRelation.Eq || query.key.name != primary.name) return null
+        return query.key.toAny()
+    }
+    private fun decodeFetched(data: Any, read: ReadContext?): ValueType {
+        if (read == null || read.database.readCache !== read.cache) return decodeData(data)
+        @Suppress("UNCHECKED_CAST")
+        return read.cache.decode(tableName, read.generation, data, codecIdentity, read.capacity,
+            { decodeData(data) }, { value -> primaryKeyOf(value as ValueType).takeUnless { it === Unattributed } }) as ValueType
+    }
+    internal fun decodeRows(rows: List<Any>, read: ReadContext? = null): List<ValueType> {
+        if (!delegate.isSerialized) { @Suppress("UNCHECKED_CAST") return rows as List<ValueType> }
+        if (read == null) return LazyMapList(rows) { decodeData(it) }
+        read.cache.storeRows(tableName, read.generation, rows, read.capacity)
+        // Only the bounded store cache retains decoded elements, never a second per-list cache.
+        return object : AbstractList<ValueType>() {
+            override val size: Int get() = rows.size
+            override fun get(index: Int): ValueType = decodeFetched(rows[index], read)
         }
     }
 
-    protected suspend fun getMany(relations: List<StoreRelation>): List<ValueType> =
-        delegate.getMany(tableName, relations).map {
-            if (delegate.isSerialized) decodeData(it) else { @Suppress("UNCHECKED_CAST") (it as ValueType) }
+    protected suspend fun getAll(query: StoreRelation? = null): List<ValueType> {
+        val read = readContext()
+        val key = primaryQueryKey(query)
+        if (read != null && key != null) {
+            val hit = read.cache.lookup(tableName, key)
+            if (hit is SharedReadCache.Lookup.Hit) return decodeRows(listOfNotNull(hit.data), read)
         }
+        val rows = delegate.getAll(tableName, query)
+        if (read != null && key != null && rows.size <= 1) {
+            read.cache.store(tableName, read.generation, mapOf(key to rows.firstOrNull()), read.capacity)
+        }
+        return decodeRows(rows, read)
+    }
+
+    protected suspend fun getMany(relations: List<StoreRelation>): List<ValueType> {
+        if (relations.isEmpty()) return emptyList()
+        val read = readContext()
+        val keys = relations.map(::primaryQueryKey)
+        if (read == null) return decodeRows(delegate.getMany(tableName, relations))
+        val groups = MutableList<List<Any>?>(relations.size) { null }
+        val missing = mutableListOf<Int>()
+        keys.forEachIndexed { index, key ->
+            val hit = if (key != null) read.cache.lookup(tableName, key) else SharedReadCache.Lookup.Miss
+            if (hit is SharedReadCache.Lookup.Hit) groups[index] = listOfNotNull(hit.data) else missing.add(index)
+        }
+        val byKey = missing.groupBy { keys[it] ?: UncachedRelation(it) }
+        val fetch: suspend () -> Unit = {
+            byKey.values.map { it.first() }.chunked(read.database.readCacheConfiguration.batchSize).forEach { indices ->
+                val fetched = delegate.getManyGrouped(tableName, indices.map { relations[it] })
+                check(fetched.size == indices.size) { "Grouped read must return one group per relation" }
+                indices.forEachIndexed { offset, index ->
+                    val rows = fetched[offset]
+                    byKey.getValue(keys[index] ?: UncachedRelation(index)).forEach { groups[it] = rows }
+                    if (keys[index] != null && rows.size <= 1) read.cache.store(tableName, read.generation, mapOf(keys[index] to rows.firstOrNull()), read.capacity)
+                }
+            }
+        }
+        // All miss batches read one backend snapshot, just like the original getMany operation.
+        if (missing.isNotEmpty()) {
+            val scoped = delegate as? ScopedStoreDelegate
+            if (scoped?.supportsTransactions == true) scoped.transaction(setOf(tableName), TransactionMode.READ_ONLY, fetch) else fetch()
+        }
+        if (read.cache.generation(tableName) != read.generation) {
+            // A write overlapped cache hits/miss batches. Read one fresh backend snapshot rather
+            // than returning a mixture of rows from before and after that write.
+            val fresh = readContext()
+            return decodeRows(delegate.getMany(tableName, relations), fresh)
+        }
+        return decodeRows(concatenateFetchedRows(groups.map { it.orEmpty() }), read)
+    }
 
     protected suspend fun get(query: StoreRelation? = null): ValueType? {
+        val read = readContext()
         val loaded = cachedGet(query)
         @Suppress("UNCHECKED_CAST")
         if (loaded?.decoded == true) return loaded.value as ValueType?
         val data = if (loaded != null) loaded.data else delegate.get(tableName, query)
-
-        return if (delegate.isSerialized) {
-            data?.let { decodeData(it) }
-        } else {
-            @Suppress("UNCHECKED_CAST")
-            data as? ValueType
+        if (data == null) {
+            val key = primaryQueryKey(query)
+            if (read != null && key != null) read.cache.store(tableName, read.generation, mapOf(key to null), read.capacity)
+            return null
         }
+        return decodeFetched(data, read)
     }
 
     /** Primary-key lookups outside transactions; null when the read must go to the delegate directly. */
@@ -400,7 +471,7 @@ public open class Store<ValueType>(
         val database = database ?: return null
         val cache = database.readCache ?: return null
         val settings = database.readCacheConfiguration
-        if (query !is StoreRelation.Eq || settings == ReadCacheConfiguration.Disabled) return null
+        if (query !is StoreRelation.Eq || settings.maxEntriesPerStore == 0) return null
         if (currentCoroutineContext()[Database.Owner] != null) return null
         val primary = database.configuration.stores.singleOrNull { it.name.value == tableName }?.primaryKey ?: return null
         val key = query.key
@@ -409,36 +480,22 @@ public open class Store<ValueType>(
         return when (val lookup = cache.lookup(tableName, cacheKey)) {
             is SharedReadCache.Lookup.Hit -> ReadBatcher.Loaded(lookup.data, null, false)
             SharedReadCache.Lookup.Bypass -> null
-            SharedReadCache.Lookup.Miss -> batches.load(cacheKey, query, settings.batchSize) { requests ->
+            SharedReadCache.Lookup.Miss -> cache.batcher(tableName).load(cacheKey, query, settings.batchSize) { requests ->
                 loadBatch(cache, settings, requests)
             }
         }
     }
 
-    /** Completes every request; failures are reported to the requests they affect. */
+    /** Grouped results identify primary-key rows without eagerly decoding batch members. */
     private suspend fun loadBatch(cache: SharedReadCache, settings: ReadCacheConfiguration, requests: Map<Any?, ReadBatcher.Request>) {
         try {
             val generation = cache.generation(tableName)
-            val found = mutableMapOf<Any?, ReadBatcher.Loaded>()
-            var unattributed = false
-            for (data in delegate.getMany(tableName, requests.values.map { it.relation })) {
-                val value = try { decodeData(data) } catch (_: Exception) { unattributed = true; continue }
-                val key = primaryKeyOf(value)
-                if (key in requests && key !in found) found[key] = ReadBatcher.Loaded(data, value, true) else unattributed = true
-            }
-            // Rows whose decoded value does not reproduce the requested key are read individually,
-            // so a corrupt or non-canonical row only affects its own caller.
-            val failures = mutableMapOf<Any?, Throwable>()
-            if (unattributed) requests.forEach { (key, request) ->
-                if (key !in found) try {
-                    found[key] = ReadBatcher.Loaded(delegate.get(tableName, request.relation), null, false)
-                } catch (error: Throwable) { failures[key] = error }
-            }
-            cache.store(tableName, generation, requests.keys.filter { it !in failures }.associateWith { found[it]?.data }, settings.maxEntriesPerStore)
+            val fetched = delegate.getManyGrouped(tableName, requests.values.map { it.relation })
+            check(fetched.size == requests.size) { "Grouped read must return one group per relation" }
+            val rows = requests.keys.zip(fetched.map { it.firstOrNull() }).toMap()
+            cache.store(tableName, generation, rows, settings.maxEntriesPerStore)
             requests.forEach { (key, request) ->
-                val failure = failures[key]
-                if (failure != null) request.result.completeExceptionally(failure)
-                else request.result.complete(found[key] ?: ReadBatcher.Loaded(null, null, true))
+                request.result.complete(ReadBatcher.Loaded(rows[key], null, false))
             }
         } catch (error: Throwable) {
             requests.values.forEach { it.result.completeExceptionally(error) }

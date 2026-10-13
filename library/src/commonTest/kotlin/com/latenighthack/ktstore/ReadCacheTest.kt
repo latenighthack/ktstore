@@ -39,6 +39,47 @@ class ReadCacheTest {
         assertSame(SharedReadCache.Lookup.Miss, cache.lookup("users", 3))
     }
 
+    @Test fun payloadsShareDecodesAcrossFetchesButSeparateCodecs() {
+        val cache = SharedReadCache()
+        val payload = byteArrayOf(1, 2)
+        val codec = Any()
+        var decodes = 0
+        val generation = cache.generation("users")
+        cache.storeRows("users", generation, listOf(payload), 2)
+        val value = cache.decode("users", generation, payload, codec, 2, { decodes++; Any() }, { 1 })
+        assertSame(value, cache.decode("users", generation, payload.copyOf(), codec, 2, { decodes++; Any() }, { 1 }))
+        assertEquals(1, decodes)
+        assertContentEquals(payload, cache.data(1) as ByteArray)
+        val otherView = cache.decode("users", generation, payload, Any(), 2, { "different view" }, { 1 })
+        assertEquals("different view", otherView)
+        assertSame(value, cache.decode("users", generation, payload, codec, 2, { error("already decoded") }, { 1 }))
+    }
+
+    @Test fun invalidationDuringDecodeCannotPublishTheOldObject() {
+        val cache = SharedReadCache()
+        val generation = cache.generation("users")
+        cache.decode("users", generation, byteArrayOf(1), Any(), 2, {
+            cache.beginWrite("users", listOf(1)); cache.endWrite("users")
+            "old object"
+        }, { 1 })
+        assertSame(SharedReadCache.Lookup.Miss, cache.lookup("users", 1))
+        cache.decode("users", generation, byteArrayOf(1), Any(), 2, { "old object" }, { 1 })
+        assertSame(SharedReadCache.Lookup.Miss, cache.lookup("users", 1))
+    }
+
+    @Test fun unaccessedPayloadsAndAbsencesShareTheCapacityBound() {
+        val cache = SharedReadCache()
+        val generation = cache.generation("users")
+        val codec = Any()
+        val first = cache.decode("users", generation, byteArrayOf(1), codec, 2, { Any() }, { 1 })
+        cache.storeRows("users", generation, listOf(byteArrayOf(2), byteArrayOf(3)), 2)
+        assertSame(SharedReadCache.Lookup.Miss, cache.lookup("users", 1))
+        val next = cache.decode("users", generation, byteArrayOf(1), codec, 2, { Any() }, { 1 })
+        assertNotSame(first, next)
+        cache.store("users", generation, mapOf(4 to null, 5 to null), 2)
+        assertSame(SharedReadCache.Lookup.Miss, cache.lookup("users", 1))
+    }
+
     @Test fun cancelledBatchLeaderStillCompletesMembers() = runTest {
         val batcher = ReadBatcher()
         val relation = { id: Int -> StoreRelation.Eq(StoreKey.IntegerKey("id").bind(id)) }

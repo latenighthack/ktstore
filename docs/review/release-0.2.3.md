@@ -15,3 +15,7 @@ The cache assumes every writer is a ktstore handle in the same process. `createP
 SQLite `getMany` now reads all relations in one transaction, and IndexedDB `getMany` uses one IndexedDB transaction.
 
 Conformance coverage runs the list contract on memory, JDBC SQLite, IndexedDB, iOS simulator, macOS and Android instrumented backends, and the corrupt-read and read-cache cases (batching, eviction, invalidation by every write path, rollback, shared handles, corrupt rows within a batch, disabled cache) on every serialized backend.
+
+## Correction: lazy decoding restored
+
+The eager decoding change above was contrary to the intended behavior. `Store.getAll()` now returns an `AbstractList` with lazy decoding backed by the shared store row cache. Equality and other list operations retain standard list behavior; corrupt payloads fail when accessed. Fetched payloads and decoded objects share one bounded cache per store across read paths. Primary-key hits, including grouped reads, reuse cached fetches, and misses use bounded batches. Transaction reads bypass the shared cache. Raw result rows are still fetched before `getAll()` returns.

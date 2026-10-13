@@ -34,6 +34,12 @@ abstract class DatabaseConformance {
 
     protected class UserListStore(database: Database) : Store<example.UserV2>(database, example.UsersV2) {
         suspend fun all(): List<example.UserV2> = getAll()
+        suspend fun many(ids: List<Int>) = getMany(ids.map { example.UsersV2.id.eq(it) })
+        suspend fun mixed(id: Int, name: String) = getMany(listOf(example.UsersV2.id.eq(id), example.UsersV2.name.eq(name)))
+        suspend fun namedMany(names: List<String>) = getMany(names.map { example.UsersV2.name.eq(it) })
+        suspend fun named(name: String) = getAll(example.UsersV2.name.eq(name))
+        suspend fun oneNamed(name: String) = get(example.UsersV2.name.eq(name))
+        suspend fun byId(id: Int) = getAll(example.UsersV2.id.eq(id))
         suspend fun find(id: Int): example.UserV2? = get(example.UsersV2.id.eq(id))
         suspend fun put(value: example.UserV2) = save(value)
         suspend fun remove(id: Int) = delete(example.UsersV2.id.eq(id))

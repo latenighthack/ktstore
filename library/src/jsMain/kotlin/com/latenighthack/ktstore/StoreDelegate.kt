@@ -314,7 +314,11 @@ class IndexDB(
     override suspend fun get(tableName: String, relation: StoreRelation?): Any? = getAll(tableName, relation).firstOrNull()
     override suspend fun getMany(tableName: String, relations: List<StoreRelation>): List<Any> {
         if (relations.isEmpty()) return emptyList()
-        return access(tableName, false) { relations.flatMap { getAll(tableName, it) } }
+        return access(tableName, false) { concatenateFetchedRows(relations.map { getAll(tableName, it) }) }
+    }
+    override suspend fun getManyGrouped(tableName: String, relations: List<StoreRelation>): List<List<Any>> {
+        if (relations.isEmpty()) return emptyList()
+        return access(tableName, false) { relations.map { getAll(tableName, it) } }
     }
     override suspend fun getAll(tableName: String, relation: StoreRelation?): List<Any> = access(tableName, false) { store ->
         val raw = if (relation == null) request(store.getAll()) else request(store.index(indexName(relation.key)).getAll(backend.keyRange.only(value(relation.key))))
@@ -322,7 +326,9 @@ class IndexDB(
         val primary = declaration.primary
         val records = (raw as Array<dynamic>).toList()
         val ordered = if (primary == null) records else records.sortedWith { a, b -> compareKeys(bound(primary, a[primary.name], declaration), bound(primary, b[primary.name], declaration)) }
-        ordered.map { it._value as Any }
+        FetchedRows(ordered.map { it._value as Any }, ordered.map {
+            primary?.let { key -> bound(key, it[key.name], declaration) }
+        })
     }
     override suspend fun deleteAll(tableName: String) { access(tableName, true) { request(it.clear()); Unit } }
     override suspend fun delete(tableName: String, relation: StoreRelation) {

@@ -26,6 +26,7 @@ class SqliteStoreDelegate(context: Context, dbName: String) : ScopedStoreDelegat
     override suspend fun get(tableName: String, relation: StoreRelation?) = delegate.get(tableName, relation)
     override suspend fun getAll(tableName: String, relation: StoreRelation?) = delegate.getAll(tableName, relation)
     override suspend fun getMany(tableName: String, relations: List<StoreRelation>) = delegate.getMany(tableName, relations)
+    override suspend fun getManyGrouped(tableName: String, relations: List<StoreRelation>) = delegate.getManyGrouped(tableName, relations)
     override suspend fun delete(tableName: String, relation: StoreRelation) = delegate.delete(tableName, relation)
     override suspend fun deleteMany(tableName: String, relations: List<StoreRelation>) = delegate.deleteMany(tableName, relations)
     override suspend fun deleteAll(tableName: String) = delegate.deleteAll(tableName)

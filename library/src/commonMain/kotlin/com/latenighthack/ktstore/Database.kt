@@ -195,7 +195,7 @@ class TransactionScope internal constructor(
     }
     suspend fun <T> getAll(store: Store<T>, relation: StoreRelation? = null): List<T> = operation(StoreName(store.tableName)) {
         checkStore(store)
-        delegate.getAll(store.tableName, relation).map { store.decodeData(it) }
+        store.decodeRows(delegate.getAll(store.tableName, relation))
     }
     suspend fun <T> save(store: Store<T>, value: T) = operation(StoreName(store.tableName), true) {
         checkStore(store); val row = store.encodeRow(value); written(store.tableName, listOf(row)); delegate.save(store.tableName, row.data, row.keys)

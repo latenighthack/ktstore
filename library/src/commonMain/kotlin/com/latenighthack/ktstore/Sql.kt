@@ -362,7 +362,10 @@ class SqlStoreDelegate(private val driver: SqlDriver, private val blobType: Stri
     }
 
     override suspend fun getMany(tableName: String, relations: List<StoreRelation>): List<Any> =
-        if (relations.isEmpty()) emptyList() else transaction { relations.flatMap { readAll(tableName, it) } }
+        if (relations.isEmpty()) emptyList() else transaction { concatenateFetchedRows(relations.map { readAll(tableName, it) }) }
+
+    override suspend fun getManyGrouped(tableName: String, relations: List<StoreRelation>): List<List<Any>> =
+        if (relations.isEmpty()) emptyList() else transaction { relations.map { readAll(tableName, it) } }
 
     private suspend fun queryKeys(table: String, query: IndexedQuery, ordered: Boolean = true): Pair<StoreKey<*>, List<StoreKey<*>>> {
         val declaration = stores.first { it.tableName == table }
@@ -461,9 +464,12 @@ class SqlStoreDelegate(private val driver: SqlDriver, private val blobType: Stri
             clause.args.forEachIndexed { index, key -> select.bind(index, key) }
             while (select.step()) rows.add(select.getBytes(0) to components.mapIndexed { i, key -> select.readKey(i + 1, key) })
         } finally { select.finalize() }
-        return rows.sortedWith { a, b ->
+        val ordered = rows.sortedWith { a, b ->
             a.second.zip(b.second).firstNotNullOfOrNull { (x, y) -> compareKeys(x, y).takeIf { it != 0 } } ?: 0
-        }.map { it.first }
+        }
+        return FetchedRows(ordered.map { it.first }, ordered.map {
+            if (primary is StoreKey.CompositeKey) primary.bind(it.second) else it.second.singleOrNull()
+        })
     }
 
     override suspend fun deleteAll(tableName: String) = transaction { clearTable(tableName) }

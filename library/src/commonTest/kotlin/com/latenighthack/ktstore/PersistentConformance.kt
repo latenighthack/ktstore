@@ -141,7 +141,44 @@ abstract class PersistentConformance : DatabaseConformance() {
         } finally { reopened.deleteDatabase() }
     } }
 
-    @Test fun storeGetAllDecodesCorruptRowsAtTheRead() = runTest { withContext(Dispatchers.Default) {
+    @Test fun storeGetAllDecodesOnlyAccessedRowsAndCachesThem() = runTest { withContext(Dispatchers.Default) {
+        var decodes = 0
+        val definition = object : StoreDefinition<example.UserV2>(example.UsersV2.storeName, example.UsersV2.payloadFormat,
+            { decodes++; example.decodeUserV2(it) }, { example.encodeUserV2(it) }) {
+            val id = integerIndex(IndexName("id"), example.UserV2::id)
+            init { primaryKey(id) }
+        }
+        val config = DatabaseConfiguration("lazy-list-${kotlin.random.Random.nextInt()}", 1, listOf(definition.declaration))
+        val counts = CountingDelegate(backend(config))
+        val db = Database(config, counts)
+        val users = object : Store<example.UserV2>(db, definition) {
+            suspend fun all() = getAll()
+            suspend fun find(id: Int) = get(definition.id.eq(id))
+        }
+        try {
+            db.open(); users.prepare()
+            db.transaction(setOf(definition.storeName)) {
+                saveAll(users, (1..100).map { example.UserV2(it, "User$it", true) })
+            }
+            decodes = 0
+            val rows = users.all()
+            assertEquals(100, rows.size)
+            val slice = rows.subList(50, 60)
+            assertEquals(0, decodes, "fetching rows and inspecting size must not decode payloads")
+            val value = users.find(51)!!
+            assertTrue(counts.batches.isEmpty(), "unaccessed getAll rows already warm primary-key fetches")
+            assertSame(value, slice[0])
+            assertEquals(51, value.id)
+            assertSame(value, rows[50])
+            assertSame(value, rows.listIterator(50).next())
+            assertEquals(1, decodes, "repeated access and sublists share decoded elements")
+            db.close()
+            assertEquals(100, rows[99].id, "lazy decoding uses the fetched snapshot after close")
+            assertEquals(2, decodes)
+        } finally { db.deleteDatabase() }
+    } }
+
+    @Test fun storeGetAllDecodesCorruptRowsOnAccess() = runTest { withContext(Dispatchers.Default) {
         val config = example.UsersHistory.v2.configuration("get-all-corrupt-${kotlin.random.Random.nextInt()}")
         val db = Database(config, backend(config))
         val users = UserListStore(db)
@@ -154,7 +191,11 @@ abstract class PersistentConformance : DatabaseConformance() {
                     example.UsersV2.id.key.bind(2), example.UsersV2.name.key.bind("Corrupt"), example.UsersV2.enabled.key.bind(true),
                 )))
             }
-            assertFailsWith<StoreFailure.CorruptRecord> { users.all() }
+            val rows = users.all()
+            assertEquals(2, rows.size)
+            assertEquals(example.UserV2(1, "Alice", true), rows[0])
+            assertSame(rows[0], rows[0], "accessed rows retain their decoded value")
+            assertFailsWith<StoreFailure.CorruptRecord> { rows[1] }
         } finally { db.deleteDatabase() }
     } }
 
@@ -287,12 +328,169 @@ abstract class PersistentConformance : DatabaseConformance() {
         }
     } }
 
+    @Test fun allReadPathsShareDecodedObjectsAndWarmPrimaryKeys() = runTest { withContext(Dispatchers.Default) {
+        cachedUsers(ReadCacheConfiguration()) { _, users, counts, _ ->
+            val all = users.all()
+            val next = users.all()
+            val first = all[0]
+            assertSame(first, next[0])
+            assertSame(first, users.named("User1").single())
+            assertSame(first, users.oneNamed("User1"))
+            val secondaryMany = users.namedMany(listOf("User1", "No match", "User1"))
+            assertEquals(2, secondaryMany.size)
+            assertSame(first, secondaryMany[0]); assertSame(first, secondaryMany[1])
+            val before = counts.batches.size + counts.gets
+            assertSame(first, users.find(1))
+            assertEquals(before, counts.batches.size + counts.gets, "decoding a list row warms primary-key reads")
+            val rawReads = counts.allReads
+            assertSame(first, users.byId(1).single())
+            assertEquals(rawReads, counts.allReads, "primary-key getAll reuses a valid fetch")
+            val beforeGroups = counts.groupedBatches.size
+            val many = users.many(listOf(1, 3, 99, 3, 2))
+            assertEquals(listOf(1), counts.groupedBatches.drop(beforeGroups), "only the unknown key 99 is fetched; getAll warmed all existing keys")
+            assertSame(first, many[0])
+            assertSame(many[1], many[2], "duplicate relations share one decoded object")
+            assertEquals(listOf(1, 3, 3, 2), many.map { it.id })
+            val batches = counts.groupedBatches.size
+            val repeated = users.many(listOf(2, 99, 1, 3))
+            assertSame(many[3], repeated[0])
+            assertSame(first, repeated[1])
+            assertSame(many[1], repeated[2])
+            assertEquals(batches, counts.groupedBatches.size, "cached rows and absences avoid another fetch")
+            val mixed = users.mixed(1, "User2")
+            assertSame(first, mixed[0]); assertSame(many[3], mixed[1])
+            assertEquals(batches + 1, counts.groupedBatches.size)
+            assertEquals(1, counts.groupedBatches.last(), "mixed reads fetch only the secondary query, not the cached primary key")
+        }
+    } }
+
+    @Test fun decodedObjectsAreSharedAcrossStoresAndOpenHandles() = runTest { withContext(Dispatchers.Default) {
+        cachedUsers(ReadCacheConfiguration()) { db, users, _, config ->
+            val otherDb = Database(config, backend(config))
+            val other = UserListStore(otherDb)
+            val sameHandle = UserListStore(db)
+            try {
+                otherDb.open(); other.prepare(); sameHandle.prepare()
+                val first = users.all().first()
+                assertSame(first, other.all().first())
+                assertSame(first, other.find(1))
+                assertSame(first, sameHandle.many(listOf(1)).single())
+                other.put(example.UserV2(1, "Changed through other handle", true))
+                val changed = other.find(1)!!
+                assertNotSame(first, changed)
+                assertSame(changed, users.find(1))
+                assertSame(changed, sameHandle.all().first())
+            } finally { otherDb.close() }
+        }
+    } }
+
+    @Test fun manyFetchesAreBoundedAndStayLazy() = runTest { withContext(Dispatchers.Default) {
+        var decodes = 0
+        val definition = object : StoreDefinition<example.UserV2>(StoreName("lazy_many"), "user-v2",
+            { decodes++; example.decodeUserV2(it) }, { example.encodeUserV2(it) }) {
+            val id = integerIndex(IndexName("id"), example.UserV2::id)
+            init { primaryKey(id) }
+        }
+        val config = DatabaseConfiguration("many-lazy-${kotlin.random.Random.nextInt()}", 1, listOf(definition.declaration))
+        val counts = CountingDelegate(backend(config))
+        val db = Database(config, counts, ReadCacheConfiguration(batchSize = 4))
+        val users = object : Store<example.UserV2>(db, definition) {
+            suspend fun many(ids: List<Int>) = getMany(ids.map { definition.id.eq(it) })
+            suspend fun all() = getAll()
+            suspend fun find(id: Int) = get(definition.id.eq(id))
+        }
+        try {
+            db.open(); users.prepare()
+            db.transaction(setOf(definition.storeName)) { saveAll(users, (1..10).map { example.UserV2(it, "User$it", true) }) }
+            decodes = 0
+            val rows = users.many((1..11).toList())
+            assertEquals(listOf(4, 4, 3), counts.groupedBatches)
+            assertEquals(10, rows.size)
+            assertEquals(0, decodes)
+            val all = users.all()
+            assertEquals(0, decodes)
+            val first = rows[0]
+            assertSame(first, all[0])
+            assertSame(first, users.find(1))
+            assertEquals(1, decodes)
+        } finally { db.deleteDatabase() }
+    } }
+
+    @Test fun oldListsCannotResurrectInvalidatedRowsAndEvictionDropsDecodedObjects() = runTest { withContext(Dispatchers.Default) {
+        cachedUsers(ReadCacheConfiguration(maxEntriesPerStore = 2)) { _, users, counts, _ ->
+            val old = users.byId(1)
+            val original = old.single()
+            assertSame(original, users.find(1))
+            users.put(example.UserV2(1, "Changed", true))
+            val changed = users.find(1)!!
+            assertEquals("User1", old.single().name, "old lists remain read snapshots")
+            assertSame(changed, users.find(1), "old access cannot overwrite the updated cache")
+            users.find(2); users.find(3)
+            val before = counts.batches.size
+            val fetched = users.find(1)!!
+            assertNotSame(changed, fetched, "eviction includes decoded objects")
+            assertEquals(before + 1, counts.batches.size)
+            assertSame(fetched, users.byId(1).single())
+        }
+    } }
+
+    @Test fun manyRefetchesWhenAWriteOverlapsCachedHitsAndMisses() = runTest { withContext(Dispatchers.Default) {
+        val config = example.UsersHistory.v2.configuration("many-write-race-${kotlin.random.Random.nextInt()}")
+        val counts = CountingDelegate(backend(config))
+        var beforeRead: (suspend () -> Unit)? = null
+        val wrapper = object : LifecycleStoreDelegate by counts, ScopedStoreDelegate {
+            override val supportsTransactions get() = counts.supportsTransactions
+            override suspend fun <T> transaction(block: suspend () -> T): T = counts.transaction(block)
+            override suspend fun <T> transaction(lockKey: String, block: suspend () -> T): T = counts.transaction(lockKey, block)
+            override suspend fun <T> transaction(stores: Set<String>, mode: TransactionMode, block: suspend () -> T): T {
+                if (mode == TransactionMode.READ_ONLY) {
+                    val pending = beforeRead; beforeRead = null
+                    pending?.invoke()
+                }
+                return counts.transaction(stores, mode, block)
+            }
+        }
+        val db = Database(config, wrapper)
+        val users = UserListStore(db)
+        try {
+            db.open(); users.prepare()
+            users.put(example.UserV2(1, "Before", true)); users.put(example.UserV2(2, "Second", true))
+            users.find(1)
+            beforeRead = { users.put(example.UserV2(1, "After", true)) }
+            val rows = users.many(listOf(1, 2))
+            assertEquals(listOf("After", "Second"), rows.map { it.name })
+            assertEquals(listOf(1, 1), counts.groupedBatches, "initial key 1 and the key 2 miss each fetch one group")
+            assertEquals(listOf(1, 1, 2), counts.batches, "overlapping writes force one complete fresh read")
+            assertSame(rows[0], users.find(1))
+        } finally { db.deleteDatabase() }
+    } }
+
+    @Test fun sharedListsNeverPublishUncommittedOrRolledBackObjects() = runTest { withContext(Dispatchers.Default) {
+        cachedUsers(ReadCacheConfiguration()) { db, users, _, _ ->
+            val original = users.find(1)
+            lateinit var uncommitted: List<example.UserV2>
+            assertFailsWith<IllegalStateException> {
+                db.transaction("rollback-list") {
+                    users.put(example.UserV2(1, "Uncommitted", true))
+                    uncommitted = users.byId(1)
+                    error("rollback")
+                }
+            }
+            assertEquals("Uncommitted", uncommitted.single().name)
+            assertEquals(original, users.find(1))
+            assertNotSame(uncommitted.single(), users.find(1))
+        }
+    } }
+
     @Test fun storeGetCacheCanBeDisabled() = runTest { withContext(Dispatchers.Default) {
         cachedUsers(ReadCacheConfiguration.Disabled) { _, users, counts, _ ->
             findConcurrently(users, listOf(1, 2, 3))
             users.find(1)
             assertEquals(4, counts.gets)
             assertTrue(counts.batches.isEmpty())
+            val first = users.all().first()
+            assertNotSame(first, users.all().first(), "disabled caches do not share decoded list objects")
+            assertNotSame(first, users.find(1), "disabled primary-key reads do not share decoded list objects")
         }
     } }
 

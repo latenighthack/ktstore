@@ -4,6 +4,8 @@ package com.latenighthack.ktstore
 internal class CountingDelegate(private val backend: LifecycleStoreDelegate) : ScopedStoreDelegate, LifecycleStoreDelegate {
     private val scoped get() = backend as ScopedStoreDelegate
     var gets = 0
+    var allReads = 0
+    val groupedBatches = mutableListOf<Int>()
     val batches = mutableListOf<Int>()
 
     override suspend fun get(tableName: String, relation: StoreRelation?): Any? { gets++; return backend.get(tableName, relation) }
@@ -11,7 +13,12 @@ internal class CountingDelegate(private val backend: LifecycleStoreDelegate) : S
         batches.add(relations.size)
         return backend.getMany(tableName, relations)
     }
-    override suspend fun getAll(tableName: String, relation: StoreRelation?) = backend.getAll(tableName, relation)
+    override suspend fun getAll(tableName: String, relation: StoreRelation?): List<Any> { allReads++; return backend.getAll(tableName, relation) }
+    override suspend fun getManyGrouped(tableName: String, relations: List<StoreRelation>): List<List<Any>> {
+        groupedBatches.add(relations.size)
+        batches.add(relations.size)
+        return backend.getManyGrouped(tableName, relations)
+    }
     override suspend fun saveAll(tableName: String, rows: List<StoreRow>) = backend.saveAll(tableName, rows)
     override suspend fun deleteMany(tableName: String, relations: List<StoreRelation>) = backend.deleteMany(tableName, relations)
     override suspend fun registerStore(tableName: String, keys: List<StoreKey<*>>, primaryKey: StoreKey<*>?) = backend.registerStore(tableName, keys, primaryKey)

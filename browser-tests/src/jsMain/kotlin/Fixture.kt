@@ -47,6 +47,15 @@ fun main() {
             val tests = object : PersistentConformance() {
                 override fun backend(config: DatabaseConfiguration): LifecycleStoreDelegate = IndexDB(config)
             }
+            runConformance("allReadPathsShareDecodedObjectsAndWarmPrimaryKeys") { tests.allReadPathsShareDecodedObjectsAndWarmPrimaryKeys() }
+            runConformance("decodedObjectsAreSharedAcrossStoresAndOpenHandles") { tests.decodedObjectsAreSharedAcrossStoresAndOpenHandles() }
+            runConformance("manyFetchesAreBoundedAndStayLazy") { tests.manyFetchesAreBoundedAndStayLazy() }
+            runConformance("oldListsCannotResurrectInvalidatedRowsAndEvictionDropsDecodedObjects") { tests.oldListsCannotResurrectInvalidatedRowsAndEvictionDropsDecodedObjects() }
+            runConformance("manyRefetchesWhenAWriteOverlapsCachedHitsAndMisses") { tests.manyRefetchesWhenAWriteOverlapsCachedHitsAndMisses() }
+            runConformance("sharedListsNeverPublishUncommittedOrRolledBackObjects") { tests.sharedListsNeverPublishUncommittedOrRolledBackObjects() }
+            runConformance("storeGetAllReturnsValueEqualLists") { tests.storeGetAllReturnsValueEqualLists() }
+            runConformance("storeGetAllDecodesOnlyAccessedRowsAndCachesThem") { tests.storeGetAllDecodesOnlyAccessedRowsAndCachesThem() }
+            runConformance("storeGetAllDecodesCorruptRowsOnAccess") { tests.storeGetAllDecodesCorruptRowsOnAccess() }
             runConformance("wholeReadsUseLogicalPrimaryOrdering") { tests.wholeReadsUseLogicalPrimaryOrdering() }
             runConformance("commitRollbackAndSecondaryDeletion") { tests.commitRollbackAndSecondaryDeletion() }
             runConformance("readonlyAndUndeclaredStoreAccessRollback") { tests.readonlyAndUndeclaredStoreAccessRollback() }

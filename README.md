@@ -50,7 +50,9 @@ Native providers supply an absolute, app-owned file location and choose backup e
 
 ## Read cache
 
-Typed `Store.get` lookups by primary key outside a transaction are cached, and concurrent misses for one store are read together in a single batched `getMany`. Reads inside transactions always reach the database and see the transaction's own writes.
+Typed `Store.get`, `getAll`, and `getMany` reads outside transactions populate one shared row cache per store. List payloads are decoded lazily on element access, and decoded objects are cached alongside fetched payloads: different lists, sublists, queries and compatible store instances reuse the same object while its row remains valid and resident. Standard list equality and operations come from `AbstractList`. Lists preserve their fetched snapshot after writes, but accessing an old list cannot restore invalidated rows to the shared cache.
+
+Valid primary-key hits avoid fetching. Concurrent `get` misses are batched; `getMany` fetches only missing primary keys in bounded batches, preserving relation order, duplicate matches and cached absences. Whole-store and secondary-index queries still query the backend for membership, then reuse the shared row objects. Native backends retain fetched primary-key metadata, so even an unaccessed list warms primary-key fetches without decoding. Custom delegates returning payloads without key metadata gain primary-key attribution when a row is decoded. Reads inside transactions bypass the shared cache and see the transaction's own writes.
 
 ```kotlin
 val db = Database(configuration, delegate, ReadCacheConfiguration(maxEntriesPerStore = 1_000, batchSize = 50))
