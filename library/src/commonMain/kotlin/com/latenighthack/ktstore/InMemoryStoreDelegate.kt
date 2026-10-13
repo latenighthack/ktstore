@@ -213,33 +213,10 @@ public class InMemoryStoreDelegate : ScopedStoreDelegate, LifecycleStoreDelegate
 
     private fun StoreRelation?.toPredicate(): ((DataRow<*>) -> Boolean) {
         val relation = this ?: return { true }
+        val key = relation.key
+        // Stored values use the same representation; sparse null rows never equal a non-null key.
+        val expected = key.toAny()
 
-        return { row ->
-            val key = relation.key
-
-            if (key is BoundStoreKey.CompositeKey) {
-                key.values.fold(true) { currentAnd, boundKey ->
-                    val isEqual = if (boundKey is BoundStoreKey.SerializedKey) {
-                        val value = boundKey.value
-
-                        value.contentEquals((row.values[boundKey.name] as ComparableByteArray).rawValue)
-                    } else {
-                        val value = boundKey.toAny()
-
-                        (row.values[boundKey.name] == value)
-                    }
-
-                    currentAnd && isEqual
-                }
-            } else if (key is BoundStoreKey.SerializedKey) {
-                val value = key.value
-
-                value.contentEquals((row.values[key.name] as ComparableByteArray).rawValue)
-            } else {
-                val value = key.toAny()
-
-                (row.values[key.name] == value)
-            }
-        }
+        return { row -> row.values[key.name] == expected }
     }
 }

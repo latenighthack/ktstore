@@ -163,6 +163,26 @@ abstract class DatabaseConformance {
         } finally { delegate.deleteDatabase() }
     } }
 
+    @Test fun nullableBinaryEqualitySkipsSparseRows() = runTest { withContext(Dispatchers.Default) {
+        val pk = StoreKey.IntegerKey("id")
+        val bytes = StoreKey.SerializedKey("binary_ref", nullable = true)
+        val part = StoreKey.IntegerKey("part")
+        val composite = StoreKey.CompositeKey("binary_part", listOf(bytes.name, part.name))
+        val config = DatabaseConfiguration("sparse-binary-${kotlin.random.Random.nextInt()}", 1, listOf(StoreDeclaration(first, listOf(pk, bytes, part, composite), pk)))
+        val db = Database(config, backend(config))
+        try {
+            db.open()
+            db.transaction(setOf(first)) {
+                saveAll(first, listOf(1 to null, 2 to byteArrayOf(0, -1), 3 to byteArrayOf(1)).map { (i, value) ->
+                    StoreRow(byteArrayOf(i.toByte()), listOf(pk.bind(i), bytes.bind(value), part.bind(7)))
+                })
+                assertEquals(listOf(2), getAll(first, StoreRelation.Eq(bytes.bind(byteArrayOf(0, -1)))).map { (it as ByteArray)[0].toInt() })
+                val key = composite.bind(listOf(bytes.bind(byteArrayOf(1)), part.bind(7)))
+                assertEquals(listOf(3), getAll(first, StoreRelation.Eq(key)).map { (it as ByteArray)[0].toInt() })
+            }
+        } finally { db.deleteDatabase() }
+    } }
+
     @Test fun binaryCompositeKeysAndAtomicBatches() = runTest { withContext(Dispatchers.Default) {
         val bytes = StoreKey.SerializedKey("binary_id")
         val component = StoreKey.IntegerKey("part")

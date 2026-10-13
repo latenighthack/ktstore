@@ -36,4 +36,5 @@ class IndexedDbConformanceTest : PersistentConformance() {
     @Test fun verifyManyWriteOverlap() = manyRefetchesWhenAWriteOverlapsCachedHitsAndMisses()
     @Test fun verifyListRollbackCache() = sharedListsNeverPublishUncommittedOrRolledBackObjects()
     @Test fun verifyReadCacheDisabled() = storeGetCacheCanBeDisabled()
+    @Test fun verifyNullableBinaryEquality() = nullableBinaryEqualitySkipsSparseRows()
 }
