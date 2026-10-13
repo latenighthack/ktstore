@@ -10,6 +10,8 @@ kotlin {
             kotlin.srcDir("../migration-example-spec/src/commonMain/kotlin")
             kotlin.srcDir("../migration-example/src/migrations/main")
             kotlin.srcDir("../migration-example/src/migrations/test")
+            // Library-internal unit tests run in the library's own test tasks.
+            kotlin.exclude("**/ReadCacheTest.kt")
             dependencies {
                 implementation(project(":library"))
                 implementation(libs.kotlinx.coroutines.core)
