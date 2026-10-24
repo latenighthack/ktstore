@@ -26,3 +26,9 @@ fun createPostgresDatabase(
     decorate: (LifecycleStoreDelegate) -> LifecycleStoreDelegate = { it },
 ): Database =
     Database(configuration, decorate(SqlStoreDelegate(JdbcDriver(location.removePrefix("jdbc:postgresql:"), "postgresql"), "BYTEA", configuration)), readCache)
+
+fun createPostgresDatabase(
+    configuration: DatabaseConfiguration, location: String, readCache: ReadCacheConfiguration, observer: StoreObserver?,
+    decorate: (LifecycleStoreDelegate) -> LifecycleStoreDelegate = { it },
+): Database =
+    Database(configuration, decorate(SqlStoreDelegate(JdbcDriver(location.removePrefix("jdbc:postgresql:"), "postgresql"), "BYTEA", configuration)), readCache, observer)

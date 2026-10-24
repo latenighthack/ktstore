@@ -78,6 +78,7 @@ class SqlStoreDelegate(private val driver: SqlDriver, private val blobType: Stri
         if (config == null) { stores.forEach { create(it) }; return }
         if (blobType !in setOf("BLOB", "BYTEA") || driver !is ManagedSqlDriver) throw StoreFailure.InvalidUsage()
         val before = stores.toList()
+        val reporter = kotlin.coroutines.coroutineContext[MigrationReporter]
         try {
             transaction("ktstore.schema.${config.identity}") {
                 val metadataExists = scalar(if (blobType == "BYTEA")
@@ -90,7 +91,9 @@ class SqlStoreDelegate(private val driver: SqlDriver, private val blobType: Stri
                     "SELECT count(*) FROM information_schema.tables WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' AND left(table_name, 8) != 'ktstore_'"
                     else "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name != 'android_metadata' AND name NOT LIKE 'ktstore_%'") > 0
                 val old = if (persisted == 0 && existing) config.legacyVersion ?: throw StoreFailure.Migration() else persisted
+                reporter?.storedVersion = old
                 if (old > config.version) throw StoreFailure.Migration()
+                reporter?.started(old, when (old) { 0 -> MigrationKind.FRESH; config.version -> MigrationKind.CURRENT; else -> MigrationKind.UPGRADE })
                 if (old == 0) stores.toList().forEach { create(it) }
                 else {
                     val steps = config.steps(old)
@@ -101,7 +104,7 @@ class SqlStoreDelegate(private val driver: SqlDriver, private val blobType: Stri
                             finally { metadata.finalize() }
                         }
                     }
-                    steps.forEach { step ->
+                    steps.forEach { step -> reporter.step(step) {
                     step.sourceSchema?.let { schema ->
                         validateStoreNames(schema)
                         validateSchema(schema)
@@ -115,15 +118,17 @@ class SqlStoreDelegate(private val driver: SqlDriver, private val blobType: Stri
                         stores.clear()
                         stores.addAll(schema.map { TableDescriptor(it.name.value, it.keys, it.primaryKey) })
                     }
+                } }
                 }
+                reporter.verify(config.version) {
+                    if (old == config.version) {
+                        val metadata = driver.selectAll("SELECT fingerprint FROM ktstore_schema WHERE id = 1")
+                        try { if (!metadata.step() || metadata.getText(0) != config.fingerprint()) throw StoreFailure.Migration() }
+                        finally { metadata.finalize() }
+                    }
+                    validateStoreNames(config.stores)
+                    validateSchema(config.stores)
                 }
-                if (old == config.version) {
-                    val metadata = driver.selectAll("SELECT fingerprint FROM ktstore_schema WHERE id = 1")
-                    try { if (!metadata.step() || metadata.getText(0) != config.fingerprint()) throw StoreFailure.Migration() }
-                    finally { metadata.finalize() }
-                }
-                validateStoreNames(config.stores)
-                validateSchema(config.stores)
                 if (old != config.version) {
                     driver.createTable("CREATE TABLE IF NOT EXISTS ktstore_schema (id INTEGER PRIMARY KEY, fingerprint TEXT NOT NULL" +
                         (if (blobType == "BYTEA") ", version INTEGER NOT NULL)" else ")"))

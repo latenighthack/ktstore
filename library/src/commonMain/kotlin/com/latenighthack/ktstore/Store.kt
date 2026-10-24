@@ -401,14 +401,67 @@ public open class Store<ValueType>(
         }
     }
 
+    /** Null unless the owning database is observed; observed calls run the same read and write bodies. */
+    private val observer: StoreObserver? get() = database?.observer
+    private suspend fun inTransaction(): Boolean = database.let { it != null && currentCoroutineContext()[Database.Owner]?.database === it }
+    private fun readEvent(
+        context: kotlin.coroutines.CoroutineContext, operation: ReadOperation, relations: List<StoreRelation>, all: Boolean,
+        stats: ReadStats, inTransaction: Boolean, duration: kotlin.time.Duration, outcome: StoreOutcome,
+    ): StoreEvent {
+        val database = database!!
+        val primary = database.configuration.primaryKey(tableName)
+        return StoreEvent.Read(database.configuration.identity, context, operation, tableName,
+            if (all) null else relationIndex(relations), if (all) RelationKind.ALL else relationKind(primary, relations), relations,
+            stats.cachedRows + stats.fetchedRows, stats.cachedRows, stats.fetchedRows, stats.bytes, inTransaction, duration, outcome)
+    }
+    private suspend fun <T> observedRead(
+        observer: StoreObserver, operation: ReadOperation, relations: List<StoreRelation>, all: Boolean,
+        block: suspend (ReadStats) -> T,
+    ): T {
+        val stats = ReadStats()
+        val inTransaction = inTransaction()
+        return observer.observe({ c, d, o, _ -> readEvent(c, operation, relations, all, stats, inTransaction, d, o) }) { block(stats) }
+    }
+    /** One backend load serving cache misses; lazy results report here rather than per element. */
+    private suspend inline fun groupedRead(relations: List<StoreRelation>, load: () -> List<List<Any>>): List<List<Any>> {
+        val observer = observer ?: return load()
+        val stats = ReadStats()
+        return observer.observe({ c, d, o, _ -> readEvent(c, ReadOperation.GET_MANY_GROUPED, relations, false, stats, false, d, o) }) {
+            load().also { groups -> groups.forEach { stats.fetched(it) } }
+        }
+    }
+    private suspend fun observedWrite(observer: StoreObserver, operation: WriteOperation, rows: List<StoreRow>, block: suspend () -> Unit) {
+        val inTransaction = inTransaction()
+        val database = database!!
+        observer.observe({ c, d, o, _ ->
+            StoreEvent.Write(database.configuration.identity, c, operation, tableName, rows.size, rowBytes(rows), inTransaction, d, o)
+        }) { writing(rows, block) }
+    }
+    private suspend fun observedDelete(observer: StoreObserver, operation: DeleteOperation, relations: List<StoreRelation>, block: suspend () -> Unit) {
+        val inTransaction = inTransaction()
+        val database = database!!
+        observer.observe({ c, d, o, _ ->
+            val all = operation == DeleteOperation.DELETE_ALL
+            StoreEvent.Delete(database.configuration.identity, c, operation, setOf(tableName), if (all) null else relationIndex(relations),
+                if (all) RelationKind.ALL else relationKind(database.configuration.primaryKey(tableName), relations) ?: RelationKind.INDEX,
+                relations, null, inTransaction, d, o)
+        }) { writing(null, block) }
+    }
+
     protected suspend fun getAll(query: StoreRelation? = null): List<ValueType> {
+        val observer = observer
+        return if (observer == null) loadAll(query, null)
+        else observedRead(observer, ReadOperation.GET_ALL, listOfNotNull(query), query == null) { loadAll(query, it) }
+    }
+    private suspend fun loadAll(query: StoreRelation?, stats: ReadStats?): List<ValueType> {
         val read = readContext()
         val key = primaryQueryKey(query)
         if (read != null && key != null) {
             val hit = read.cache.lookup(tableName, key)
-            if (hit is SharedReadCache.Lookup.Hit) return decodeRows(listOfNotNull(hit.data), read)
+            if (hit is SharedReadCache.Lookup.Hit) { stats?.cached(hit.data); return decodeRows(listOfNotNull(hit.data), read) }
         }
         val rows = delegate.getAll(tableName, query)
+        stats?.fetched(rows)
         if (read != null && key != null && rows.size <= 1) {
             read.cache.store(tableName, read.generation, mapOf(key to rows.firstOrNull()), read.capacity)
         }
@@ -416,24 +469,30 @@ public open class Store<ValueType>(
     }
 
     protected suspend fun getMany(relations: List<StoreRelation>): List<ValueType> {
+        val observer = observer
+        return if (observer == null) loadMany(relations, null)
+        else observedRead(observer, ReadOperation.GET_MANY, relations, false) { loadMany(relations, it) }
+    }
+    private suspend fun loadMany(relations: List<StoreRelation>, stats: ReadStats?): List<ValueType> {
         if (relations.isEmpty()) return emptyList()
         val read = readContext()
         val keys = relations.map(::primaryQueryKey)
-        if (read == null) return decodeRows(delegate.getMany(tableName, relations))
+        if (read == null) return decodeRows(delegate.getMany(tableName, relations).also { stats?.fetched(it) })
         val groups = MutableList<List<Any>?>(relations.size) { null }
         val missing = mutableListOf<Int>()
         keys.forEachIndexed { index, key ->
             val hit = if (key != null) read.cache.lookup(tableName, key) else SharedReadCache.Lookup.Miss
-            if (hit is SharedReadCache.Lookup.Hit) groups[index] = listOfNotNull(hit.data) else missing.add(index)
+            if (hit is SharedReadCache.Lookup.Hit) { groups[index] = listOfNotNull(hit.data); stats?.cached(hit.data) } else missing.add(index)
         }
         val byKey = missing.groupBy { keys[it] ?: UncachedRelation(it) }
         val fetch: suspend () -> Unit = {
             byKey.values.map { it.first() }.chunked(read.database.readCacheConfiguration.batchSize).forEach { indices ->
-                val fetched = delegate.getManyGrouped(tableName, indices.map { relations[it] })
+                val batch = indices.map { relations[it] }
+                val fetched = groupedRead(batch) { delegate.getManyGrouped(tableName, batch) }
                 check(fetched.size == indices.size) { "Grouped read must return one group per relation" }
                 indices.forEachIndexed { offset, index ->
                     val rows = fetched[offset]
-                    byKey.getValue(keys[index] ?: UncachedRelation(index)).forEach { groups[it] = rows }
+                    byKey.getValue(keys[index] ?: UncachedRelation(index)).forEach { groups[it] = rows; stats?.fetched(rows) }
                     if (keys[index] != null && rows.size <= 1) read.cache.store(tableName, read.generation, mapOf(keys[index] to rows.firstOrNull()), read.capacity)
                 }
             }
@@ -447,17 +506,24 @@ public open class Store<ValueType>(
             // A write overlapped cache hits/miss batches. Read one fresh backend snapshot rather
             // than returning a mixture of rows from before and after that write.
             val fresh = readContext()
-            return decodeRows(delegate.getMany(tableName, relations), fresh)
+            val rows = delegate.getMany(tableName, relations)
+            stats?.apply { cachedRows = 0; fetchedRows = 0; bytes = 0; fetched(rows) }
+            return decodeRows(rows, fresh)
         }
         return decodeRows(concatenateFetchedRows(groups.map { it.orEmpty() }), read)
     }
 
     protected suspend fun get(query: StoreRelation? = null): ValueType? {
+        val observer = observer
+        return if (observer == null) load(query, null)
+        else observedRead(observer, ReadOperation.GET, listOfNotNull(query), query == null) { load(query, it) }
+    }
+    private suspend fun load(query: StoreRelation?, stats: ReadStats?): ValueType? {
         val read = readContext()
-        val loaded = cachedGet(query)
+        val loaded = cachedGet(query, stats)
         @Suppress("UNCHECKED_CAST")
         if (loaded?.decoded == true) return loaded.value as ValueType?
-        val data = if (loaded != null) loaded.data else delegate.get(tableName, query)
+        val data = if (loaded != null) loaded.data else delegate.get(tableName, query).also { stats?.fetchedOne(it) }
         if (data == null) {
             val key = primaryQueryKey(query)
             if (read != null && key != null) read.cache.store(tableName, read.generation, mapOf(key to null), read.capacity)
@@ -467,7 +533,7 @@ public open class Store<ValueType>(
     }
 
     /** Primary-key lookups outside transactions; null when the read must go to the delegate directly. */
-    private suspend fun cachedGet(query: StoreRelation?): ReadBatcher.Loaded? {
+    private suspend fun cachedGet(query: StoreRelation?, stats: ReadStats?): ReadBatcher.Loaded? {
         val database = database ?: return null
         val cache = database.readCache ?: return null
         val settings = database.readCacheConfiguration
@@ -478,11 +544,11 @@ public open class Store<ValueType>(
         if (key.name != primary.name) return null
         val cacheKey = key.toAny()
         return when (val lookup = cache.lookup(tableName, cacheKey)) {
-            is SharedReadCache.Lookup.Hit -> ReadBatcher.Loaded(lookup.data, null, false)
+            is SharedReadCache.Lookup.Hit -> { stats?.cached(lookup.data); ReadBatcher.Loaded(lookup.data, null, false) }
             SharedReadCache.Lookup.Bypass -> null
             SharedReadCache.Lookup.Miss -> cache.batcher(tableName).load(cacheKey, query, settings.batchSize) { requests ->
                 loadBatch(cache, settings, requests)
-            }
+            }.also { stats?.fetchedOne(it.data) }
         }
     }
 
@@ -490,7 +556,8 @@ public open class Store<ValueType>(
     private suspend fun loadBatch(cache: SharedReadCache, settings: ReadCacheConfiguration, requests: Map<Any?, ReadBatcher.Request>) {
         try {
             val generation = cache.generation(tableName)
-            val fetched = delegate.getManyGrouped(tableName, requests.values.map { it.relation })
+            val relations = requests.values.map { it.relation }
+            val fetched = groupedRead(relations) { delegate.getManyGrouped(tableName, relations) }
             check(fetched.size == requests.size) { "Grouped read must return one group per relation" }
             val rows = requests.keys.zip(fetched.map { it.firstOrNull() }).toMap()
             cache.store(tableName, generation, rows, settings.maxEntriesPerStore)
@@ -515,22 +582,34 @@ public open class Store<ValueType>(
     }
 
     protected suspend fun delete(query: StoreRelation) {
-        writing(null) { delegate.delete(tableName, query) }
+        val observer = observer
+        if (observer == null) writing(null) { delegate.delete(tableName, query) }
+        else observedDelete(observer, DeleteOperation.DELETE, listOf(query)) { delegate.delete(tableName, query) }
     }
 
     protected suspend fun deleteAll() {
-        writing(null) { delegate.deleteAll(tableName) }
+        val observer = observer
+        if (observer == null) writing(null) { delegate.deleteAll(tableName) }
+        else observedDelete(observer, DeleteOperation.DELETE_ALL, emptyList()) { delegate.deleteAll(tableName) }
     }
 
     protected suspend fun saveAll(values: List<ValueType>) {
         val rows = values.map(::encodeRow)
-        writing(rows) { delegate.saveAll(tableName, rows) }
+        val observer = observer
+        if (observer == null) writing(rows) { delegate.saveAll(tableName, rows) }
+        else observedWrite(observer, WriteOperation.SAVE_ALL, rows) { delegate.saveAll(tableName, rows) }
     }
 
-    protected suspend fun deleteMany(relations: List<StoreRelation>) = writing(null) { delegate.deleteMany(tableName, relations) }
+    protected suspend fun deleteMany(relations: List<StoreRelation>) {
+        val observer = observer
+        if (observer == null) writing(null) { delegate.deleteMany(tableName, relations) }
+        else observedDelete(observer, DeleteOperation.DELETE_MANY, relations) { delegate.deleteMany(tableName, relations) }
+    }
 
     protected suspend fun save(value: ValueType) {
         val row = encodeRow(value)
-        writing(listOf(row)) { delegate.save(tableName, row.data, row.keys) }
+        val observer = observer
+        if (observer == null) writing(listOf(row)) { delegate.save(tableName, row.data, row.keys) }
+        else observedWrite(observer, WriteOperation.SAVE, listOf(row)) { delegate.save(tableName, row.data, row.keys) }
     }
 }

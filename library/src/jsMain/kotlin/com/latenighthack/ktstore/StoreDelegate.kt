@@ -97,6 +97,9 @@ class IndexDB(
         val completion = CompletableDeferred<Unit>()
         var abandoned = false
         var upgradeFailure: Throwable? = null
+        // Upgrade and validation callbacks run outside the caller's coroutine.
+        val reporter = coroutineContext[MigrationReporter]
+        var upgraded = false
         val request = try { backend.factory.open(databaseName, configuration?.version ?: 1) } catch (error: Throwable) { throw failure(error) }
         pendingOpen = completion
         request.onerror = { _: dynamic -> completion.completeExceptionally(upgradeFailure ?: failure(request.error)); Unit }
@@ -109,6 +112,8 @@ class IndexDB(
                 val upgrade: suspend () -> Unit = {
                     try {
                         val old = (event.oldVersion as Number).toInt()
+                        upgraded = true
+                        reporter?.started(old, if (old == 0) MigrationKind.FRESH else MigrationKind.UPGRADE)
                         if (old == 0) declarations.values.forEach { createStore(db, it) }
                         else {
                             val config = configuration ?: throw StoreFailure.Migration()
@@ -120,11 +125,11 @@ class IndexDB(
                                     if (this@IndexDB.request(raw.objectStore("ktstore_schema").get("declaration")) != expected) throw StoreFailure.Migration()
                                 }
                             }
-                            steps.forEach { step ->
+                            steps.forEach { step -> reporter.step(step) {
                                 step.sourceSchema?.let { validateUpgrade(db, raw, it) }
                                 runMigration(scope, step.migrate)
                                 step.targetSchema?.let { validateUpgrade(db, raw, it) }
-                            }
+                            } }
                         }
                         if (configuration != null) {
                             val metadata = if (db.objectStoreNames.contains("ktstore_schema") as Boolean) raw.objectStore("ktstore_schema") else db.createObjectStore("ktstore_schema")
@@ -139,7 +144,7 @@ class IndexDB(
                     } catch (error: Throwable) { upgradeFailure = StoreFailure.Migration(error); raw.abort() }
                 }
                 upgrade.startCoroutine(object : Continuation<Unit> {
-                    override val context: CoroutineContext = Dispatchers.Unconfined
+                    override val context: CoroutineContext = Dispatchers.Unconfined + (reporter ?: EmptyCoroutineContext)
                     override fun resumeWith(result: Result<Unit>) {
                         result.exceptionOrNull()?.let { upgradeFailure = StoreFailure.Migration(it); raw.abort() }
                     }
@@ -152,7 +157,8 @@ class IndexDB(
             else {
                 val validate: suspend () -> Unit = {
                     try {
-                        if (configuration != null) {
+                        if (!upgraded) reporter?.started((db.version as Number).toInt(), MigrationKind.CURRENT)
+                        if (configuration != null) reporter.verify(configuration.version) {
                             validateNames(db, configuration.stores)
                             if (!(db.objectStoreNames.contains("ktstore_schema") as Boolean)) throw StoreFailure.Migration()
                             val tx = db.transaction((declarations.keys + "ktstore_schema").toTypedArray(), "readonly")

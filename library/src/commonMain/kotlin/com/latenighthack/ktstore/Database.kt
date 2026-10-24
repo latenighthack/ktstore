@@ -83,37 +83,59 @@ class MigrationScope internal constructor(private val operations: MigrationOpera
     private var active = true
     internal var failure: Throwable? = null
     internal fun finish() { active = false }
-    private suspend fun <T> call(block: suspend () -> T): T = suspendCoroutineUninterceptedOrReturn { continuation ->
-        if (!active) throw StoreFailure.InvalidUsage("Migration scope has expired")
-        block.startCoroutine(object : Continuation<T> {
-            override val context = this@MigrationScope.context
-            override fun resumeWith(result: Result<T>) { result.exceptionOrNull()?.let { failure = it }; continuation.resumeWith(result) }
-        })
-        COROUTINE_SUSPENDED
+    private val reporter = context[MigrationReporter]
+    private suspend fun <T> call(block: suspend () -> T): T = call(null, "", null, block)
+    /** Observed opens report each [operation] with its duration and transformed row count. */
+    private suspend fun <T> call(operation: MigrationOperationKind?, store: String, index: String?, block: suspend () -> T): T =
+        suspendCoroutineUninterceptedOrReturn { continuation ->
+            if (!active) throw StoreFailure.InvalidUsage("Migration scope has expired")
+            val reporter = if (operation == null) null else reporter
+            val mark = if (reporter != null) { reporter.rows = 0; kotlin.time.TimeSource.Monotonic.markNow() } else null
+            block.startCoroutine(object : Continuation<T> {
+                override val context = this@MigrationScope.context
+                override fun resumeWith(result: Result<T>) {
+                    result.exceptionOrNull()?.let { failure = it }
+                    if (reporter != null && operation != null && mark != null) reporter.operation(operation, store, index, mark.elapsedNow(),
+                        result.exceptionOrNull()?.let(::outcomeOf) ?: StoreOutcome.Completed)
+                    continuation.resumeWith(result)
+                }
+            })
+            COROUTINE_SUSPENDED
+        }
+    private fun counted(transform: (ByteArray) -> StoreRow): (ByteArray) -> StoreRow {
+        val reporter = reporter ?: return transform
+        return { bytes -> reporter.rows++; transform(bytes) }
     }
-    suspend fun <A, B> transformMappedStore(source: StoreDefinition<A>, target: StoreDefinition<B>, mapping: (A) -> B) = call {
-        require(source.declaration.signature() == target.declaration.signature() && source.indexEncodings == target.indexEncodings)
-        operations.validateStore(source.declaration)
-        operations.transform(source.storeName, mappedRows(source, target, mapping))
-        operations.validateStore(target.declaration)
-    }
-    suspend fun <A, B> rebuildMappedStore(source: StoreDefinition<A>, target: StoreDefinition<B>, mapping: (A) -> B) = call {
-        operations.validateStore(source.declaration)
-        operations.rebuildStore(source.storeName, target.declaration, mappedRows(source, target, mapping))
-        operations.validateStore(target.declaration)
-    }
+    suspend fun <A, B> transformMappedStore(source: StoreDefinition<A>, target: StoreDefinition<B>, mapping: (A) -> B) =
+        call(MigrationOperationKind.TRANSFORM, source.storeName.value, null) {
+            require(source.declaration.signature() == target.declaration.signature() && source.indexEncodings == target.indexEncodings)
+            operations.validateStore(source.declaration)
+            operations.transform(source.storeName, counted(mappedRows(source, target, mapping)))
+            operations.validateStore(target.declaration)
+        }
+    suspend fun <A, B> rebuildMappedStore(source: StoreDefinition<A>, target: StoreDefinition<B>, mapping: (A) -> B) =
+        call(MigrationOperationKind.REBUILD, source.storeName.value, null) {
+            operations.validateStore(source.declaration)
+            operations.rebuildStore(source.storeName, target.declaration, counted(mappedRows(source, target, mapping)))
+            operations.validateStore(target.declaration)
+        }
     internal suspend fun <A, B> applyMapping(entry: MappedStoreMigration<A, B>) {
         if (entry.operation == "transform") transformMappedStore(entry.source, entry.target, entry.mapping)
         else rebuildMappedStore(entry.source, entry.target, entry.mapping)
     }
     suspend fun storeExists(name: StoreName): Boolean = call { operations.storeExists(name) }
-    suspend fun createStore(declaration: StoreDeclaration) = call { operations.createStore(declaration) }
-    suspend fun removeStore(name: StoreName) = call { operations.removeStore(name) }
-    suspend fun addIndex(store: StoreName, key: StoreKey<*>) = call { operations.addIndex(store, key) }
-    suspend fun removeIndex(store: StoreName, name: IndexName) = call { operations.removeIndex(store, name) }
+    suspend fun createStore(declaration: StoreDeclaration) =
+        call(MigrationOperationKind.CREATE_STORE, declaration.name.value, null) { operations.createStore(declaration) }
+    suspend fun removeStore(name: StoreName) = call(MigrationOperationKind.REMOVE_STORE, name.value, null) { operations.removeStore(name) }
+    suspend fun addIndex(store: StoreName, key: StoreKey<*>) =
+        call(MigrationOperationKind.ADD_INDEX, store.value, key.name) { operations.addIndex(store, key) }
+    suspend fun removeIndex(store: StoreName, name: IndexName) =
+        call(MigrationOperationKind.REMOVE_INDEX, store.value, name.value) { operations.removeIndex(store, name) }
     suspend fun rebuildIndex(store: StoreName, key: StoreKey<*>) { removeIndex(store, IndexName(key.name)); addIndex(store, key) }
-    suspend fun transform(store: StoreName, transform: (ByteArray) -> StoreRow) = call { operations.transform(store, transform) }
-    suspend fun rebuildStore(store: StoreName, declaration: StoreDeclaration, transform: (ByteArray) -> StoreRow) = call { operations.rebuildStore(store, declaration, transform) }
+    suspend fun transform(store: StoreName, transform: (ByteArray) -> StoreRow) =
+        call(MigrationOperationKind.TRANSFORM, store.value, null) { operations.transform(store, counted(transform)) }
+    suspend fun rebuildStore(store: StoreName, declaration: StoreDeclaration, transform: (ByteArray) -> StoreRow) =
+        call(MigrationOperationKind.REBUILD, store.value, null) { operations.rebuildStore(store, declaration, counted(transform)) }
 }
 internal suspend fun runMigration(operations: MigrationOperations, block: suspend MigrationScope.() -> Unit) {
     val scope = MigrationScope(operations, coroutineContext)
@@ -175,12 +197,55 @@ class TransactionScope internal constructor(
         context[Database.Owner]?.let { it.database.joinWrite(it.state, store, rows) }
     }
 
-    suspend fun get(store: StoreName, relation: StoreRelation? = null): Any? = operation(store) { delegate.get(store.value, relation) }
-    suspend fun getAll(store: StoreName, relation: StoreRelation? = null): List<Any> = operation(store) { delegate.getAll(store.value, relation) }
-    suspend fun save(store: StoreName, row: StoreRow) = operation(store, true) { written(store.value, listOf(row)); delegate.save(store.value, row.data, row.keys) }
-    suspend fun saveAll(store: StoreName, rows: List<StoreRow>) = operation(store, true) { written(store.value, rows); delegate.saveAll(store.value, rows) }
-    suspend fun delete(store: StoreName, relation: StoreRelation) = operation(store, true) { written(store.value, null); delegate.delete(store.value, relation) }
-    suspend fun clear(store: StoreName) = operation(store, true) { written(store.value, null); delegate.deleteAll(store.value) }
+    private val database: Database? get() = context[Database.Owner]?.database
+    /** Null unless the owning database is observed; observed calls run the same body. */
+    private val observer: StoreObserver? get() = context[Database.Owner]?.database?.observer
+    private fun readEvent(
+        context: CoroutineContext, operation: ReadOperation, store: String, relation: StoreRelation?,
+        duration: kotlin.time.Duration, outcome: StoreOutcome, rows: List<Any>?,
+    ) = StoreEvent.Read(identity, context, operation, store, relationIndex(relation),
+        relationKind(database?.configuration?.primaryKey(store), relation), listOfNotNull(relation),
+        rows?.size ?: 0, 0, rows?.size ?: 0, rows?.let(::payloadBytes), true, duration, outcome)
+    private fun writeEvent(context: CoroutineContext, store: String, rows: List<StoreRow>?, single: Boolean, duration: kotlin.time.Duration, outcome: StoreOutcome) =
+        StoreEvent.Write(identity, context, if (single) WriteOperation.SAVE else WriteOperation.SAVE_ALL, store,
+            rows?.size ?: 0, rows?.let(::rowBytes), true, duration, outcome)
+    private fun deleteEvent(context: CoroutineContext, store: String, relation: StoreRelation?, duration: kotlin.time.Duration, outcome: StoreOutcome) =
+        StoreEvent.Delete(identity, context, if (relation == null) DeleteOperation.DELETE_ALL else DeleteOperation.DELETE, setOf(store),
+            relationIndex(relation), relationKind(database?.configuration?.primaryKey(store), relation) ?: RelationKind.INDEX,
+            listOfNotNull(relation), null, true, duration, outcome)
+
+    // Non-suspending so restricted operations can call them; [load] holds the delegate call.
+    private inline fun <T> fetchOne(store: String, relation: StoreRelation?, load: () -> Any?, decode: (Any) -> T): T? {
+        var row: Any? = null
+        return observer.observe(context, { c, d, o, _ -> readEvent(c, ReadOperation.GET, store, relation, d, o, listOfNotNull(row)) }) {
+            load()?.let { row = it; decode(it) }
+        }
+    }
+    private inline fun fetchAll(store: String, relation: StoreRelation?, load: () -> List<Any>): List<Any> =
+        observer.observe(context, { c, d, o, rows -> readEvent(c, ReadOperation.GET_ALL, store, relation, d, o, rows) }, load)
+    private inline fun saveRows(store: String, rows: List<StoreRow>, single: Boolean, save: () -> Unit) =
+        observer.observe(context, { c, d, o, _ -> writeEvent(c, store, rows, single, d, o) }) { written(store, rows); save() }
+    private inline fun deleteRows(store: String, relation: StoreRelation?, delete: () -> Unit) =
+        observer.observe(context, { c, d, o, _ -> deleteEvent(c, store, relation, d, o) }) { written(store, null); delete() }
+
+    suspend fun get(store: StoreName, relation: StoreRelation? = null): Any? = operation(store) {
+        fetchOne(store.value, relation, { delegate.get(store.value, relation) }) { it }
+    }
+    suspend fun getAll(store: StoreName, relation: StoreRelation? = null): List<Any> = operation(store) {
+        fetchAll(store.value, relation) { delegate.getAll(store.value, relation) }
+    }
+    suspend fun save(store: StoreName, row: StoreRow) = operation(store, true) {
+        saveRows(store.value, listOf(row), true) { delegate.save(store.value, row.data, row.keys) }
+    }
+    suspend fun saveAll(store: StoreName, rows: List<StoreRow>) = operation(store, true) {
+        saveRows(store.value, rows, false) { delegate.saveAll(store.value, rows) }
+    }
+    suspend fun delete(store: StoreName, relation: StoreRelation) = operation(store, true) {
+        deleteRows(store.value, relation) { delegate.delete(store.value, relation) }
+    }
+    suspend fun clear(store: StoreName) = operation(store, true) { deleteRows(store.value, null) { delegate.deleteAll(store.value) } }
+    /** `Database.clearStores` reports one event for all of its stores. */
+    internal suspend fun clearUnobserved(store: StoreName) = operation(store, true) { written(store.value, null); delegate.deleteAll(store.value) }
 
     private fun checkStore(store: Store<*>) {
         if (store.delegate !== delegate) {
@@ -191,20 +256,22 @@ class TransactionScope internal constructor(
     }
     suspend fun <T> get(store: Store<T>, relation: StoreRelation? = null): T? = operation(StoreName(store.tableName)) {
         checkStore(store)
-        delegate.get(store.tableName, relation)?.let { store.decodeData(it) }
+        fetchOne(store.tableName, relation, { delegate.get(store.tableName, relation) }) { store.decodeData(it) }
     }
     suspend fun <T> getAll(store: Store<T>, relation: StoreRelation? = null): List<T> = operation(StoreName(store.tableName)) {
         checkStore(store)
-        store.decodeRows(delegate.getAll(store.tableName, relation))
+        store.decodeRows(fetchAll(store.tableName, relation) { delegate.getAll(store.tableName, relation) })
     }
     suspend fun <T> save(store: Store<T>, value: T) = operation(StoreName(store.tableName), true) {
-        checkStore(store); val row = store.encodeRow(value); written(store.tableName, listOf(row)); delegate.save(store.tableName, row.data, row.keys)
+        checkStore(store); val row = store.encodeRow(value)
+        saveRows(store.tableName, listOf(row), true) { delegate.save(store.tableName, row.data, row.keys) }
     }
     suspend fun <T> saveAll(store: Store<T>, values: List<T>) = operation(StoreName(store.tableName), true) {
-        checkStore(store); val rows = values.map { store.encodeRow(it) }; written(store.tableName, rows); delegate.saveAll(store.tableName, rows)
+        checkStore(store); val rows = values.map { store.encodeRow(it) }
+        saveRows(store.tableName, rows, false) { delegate.saveAll(store.tableName, rows) }
     }
     suspend fun delete(store: Store<*>, relation: StoreRelation) = operation(StoreName(store.tableName), true) {
-        checkStore(store); written(store.tableName, null); delegate.delete(store.tableName, relation)
+        checkStore(store); deleteRows(store.tableName, relation) { delegate.delete(store.tableName, relation) }
     }
 
     suspend fun query(store: StoreName, query: IndexedQuery): QueryPage = operation(store) {
@@ -256,9 +323,15 @@ class Database(
     configuration: DatabaseConfiguration,
     internal val delegate: LifecycleStoreDelegate,
     val readCacheConfiguration: ReadCacheConfiguration,
+    /** Receives migration, read, write, delete and transaction events; absent means no reporting work. */
+    val observer: StoreObserver?,
 ) {
     constructor(configuration: DatabaseConfiguration, delegate: LifecycleStoreDelegate) :
-        this(configuration, delegate, ReadCacheConfiguration())
+        this(configuration, delegate, ReadCacheConfiguration(), null)
+    constructor(configuration: DatabaseConfiguration, delegate: LifecycleStoreDelegate, readCacheConfiguration: ReadCacheConfiguration) :
+        this(configuration, delegate, readCacheConfiguration, null)
+    constructor(configuration: DatabaseConfiguration, delegate: LifecycleStoreDelegate, observer: StoreObserver?) :
+        this(configuration, delegate, ReadCacheConfiguration(), observer)
     val configuration = configuration.snapshot()
     /** Shared by open handles with this identity; absent before open, after close, and for in-memory delegates. */
     @kotlin.concurrent.Volatile internal var readCache: SharedReadCache? = null
@@ -287,7 +360,15 @@ class Database(
         private val deletions = mutableMapOf<String, CompletableDeferred<Unit>>()
         private val readCaches = mutableMapOf<String, SharedReadCache>()
     }
+    /** Observed opens report the migration path through a [MigrationReporter] in the backend's context. */
     suspend fun open() {
+        val observer = observer ?: return open(null)
+        val reporter = MigrationReporter(observer, configuration.identity, coroutineContext, configuration.version)
+        val mark = kotlin.time.TimeSource.Monotonic.markNow()
+        try { open(reporter) } catch (error: Throwable) { reporter.finished(mark.elapsedNow(), outcomeOf(error)); throw error }
+        if (reporter.ran) reporter.finished(mark.elapsedNow(), StoreOutcome.Completed)
+    }
+    private suspend fun open(reporter: MigrationReporter?) {
         mutex.withLock { if (closed) throw StoreFailure.Closed() }
         while (true) {
             val deletion = registryMutex.withLock {
@@ -309,7 +390,8 @@ class Database(
                 cache?.beginExclusive()
                 try {
                     configuration.stores.forEach { delegate.registerStore(it.name.value, it.keys, it.primaryKey) }
-                    delegate.createStores()
+                    if (reporter == null) delegate.createStores()
+                    else { reporter.ran = true; withContext(reporter) { delegate.createStores() } }
                 } finally { cache?.endExclusive() }
                 opened = true
             }
@@ -354,6 +436,19 @@ class Database(
     suspend fun <T> transaction(
         stores: Set<StoreName>, mode: TransactionMode = TransactionMode.READ_WRITE,
         block: suspend TransactionScope.() -> T,
+    ): T {
+        // Tail calls only, so the unobserved path adds no frame state.
+        val observer = observer
+        return if (observer == null) scopedTransaction(stores, mode, block) else observedTransaction(observer, stores, mode, block)
+    }
+    private suspend fun <T> observedTransaction(
+        observer: StoreObserver, stores: Set<StoreName>, mode: TransactionMode, block: suspend TransactionScope.() -> T,
+    ): T = observer.observe({ context, duration, outcome, _ ->
+        StoreEvent.Transaction(configuration.identity, context, null, stores.map { it.value }.toSet(), mode, duration, outcome)
+    }) { scopedTransaction(stores, mode, block) }
+    private suspend fun <T> scopedTransaction(
+        stores: Set<StoreName>, mode: TransactionMode,
+        block: suspend TransactionScope.() -> T,
     ): T = coroutineScope {
         if (coroutineContext[Owner] != null) throw StoreFailure.InvalidUsage("Use the transaction scope for nested operations")
         val job = coroutineContext[Job]!!
@@ -389,7 +484,19 @@ class Database(
      * The callback must execute sequential local database work; never await network I/O.
      * The logical lock coordinates PostgreSQL processes, not just this handle.
      */
-    suspend fun <T> transaction(lockKey: String, block: suspend () -> T): T = coroutineScope {
+    suspend fun <T> transaction(lockKey: String, block: suspend () -> T): T {
+        val observer = observer
+        return if (observer == null) logicalTransaction(lockKey, block) else observedTransaction(observer, lockKey, block)
+    }
+    private suspend fun <T> observedTransaction(observer: StoreObserver, lockKey: String, block: suspend () -> T): T {
+        // Joining this handle's current transaction is not a new transaction.
+        if (currentCoroutineContext()[Owner]?.database === this) return logicalTransaction(lockKey, block)
+        return observer.observe({ context, duration, outcome, _ ->
+            StoreEvent.Transaction(configuration.identity, context, lockKey, configuration.stores.map { it.name.value }.toSet(),
+                TransactionMode.READ_WRITE, duration, outcome)
+        }) { logicalTransaction(lockKey, block) }
+    }
+    private suspend fun <T> logicalTransaction(lockKey: String, block: suspend () -> T): T = coroutineScope {
         require(lockKey.isNotBlank())
         val backend = delegate as? TransactionalStoreDelegate ?: throw StoreFailure.InvalidUsage()
         val existing = coroutineContext[Owner]
@@ -469,7 +576,10 @@ class Database(
     }
 
 
-    suspend fun clearStores(stores: Set<StoreName>) = transaction(stores) { stores.forEach { clear(it) } }
+    suspend fun clearStores(stores: Set<StoreName>) = observer.observe({ context, duration, outcome, _ ->
+        StoreEvent.Delete(configuration.identity, context, DeleteOperation.CLEAR_STORES, stores.map { it.value }.toSet(), null,
+            RelationKind.ALL, emptyList(), null, false, duration, outcome)
+    }) { transaction(stores) { stores.forEach { clearUnobserved(it) } } }
     suspend fun close() {
         if (coroutineContext[Owner]?.database === this) throw StoreFailure.InvalidUsage("Cannot close inside a transaction")
         var owner = false
@@ -512,6 +622,11 @@ expect fun createDatabase(configuration: DatabaseConfiguration, location: String
 
 fun createDatabase(configuration: DatabaseConfiguration, location: String?, readCache: ReadCacheConfiguration): Database =
     createDatabase(configuration, location).let { Database(it.configuration, it.delegate, readCache) }
+
+fun createDatabase(
+    configuration: DatabaseConfiguration, location: String?, observer: StoreObserver?,
+    readCache: ReadCacheConfiguration = ReadCacheConfiguration(),
+): Database = createDatabase(configuration, location).let { Database(it.configuration, it.delegate, readCache, observer) }
 
 internal fun DatabaseConfiguration.fingerprint(): String = stores.sortedBy { it.name.value }.joinToString(";") { store ->
     store.name.value + ":" + store.primaryKey.name + ":" + store.keys.sortedBy { it.name }.joinToString(",") { key ->

@@ -61,6 +61,21 @@ val uncached = createDatabase(configuration, location, ReadCacheConfiguration.Di
 
 The defaults are 1,000 least-recently-used rows per store (absent keys included) and batches of up to 50 keys. Handles opened in one process with the same identity share the cache. Every write made through them invalidates it: saves invalidate their primary keys; deletes, clears, indexed batch deletes and migrations invalidate the whole store. Rows written by an open transaction are not cached until it commits or rolls back. The cache assumes every writer is a ktstore handle in the same process. Disable it when another process, browser tab, worker or a bare-delegate `Store` writes the same database. `createPostgresDatabase` disables it by default. In-memory delegates are never cached.
 
+## Observation
+
+An optional `StoreObserver` receives events synchronously in the caller's coroutine. Each event carries the caller's `CoroutineContext`, so an application can attribute it to its own operation.
+
+```kotlin
+val db = createDatabase(configuration, location, StoreObserver { event ->
+    if (event is StoreEvent.Read) metrics.record(event.store, event.operation, event.duration, event.cachedRows)
+})
+// or Database(configuration, delegate, readCache, observer)
+```
+
+`Database.open()` reports `MigrationStarted` (stored and target version; `FRESH`, `CURRENT` or `UPGRADE`), a `MigrationStep` per configured migration, a `MigrationOperation` per scope operation (store or index, rows transformed, duration), `MigrationVerification`, and a terminal `MigrationFinished` naming the failed step and operation on failure. SQLite, PostgreSQL and IndexedDB report the full sequence; other delegates report only `MigrationFinished`. `Store` and `TransactionScope` reads, saves and deletes report store, index, relation kind, row counts, payload bytes, whether the rows came from the shared cache, whether the call ran inside a transaction, and duration. Batched cache misses report one `GET_MANY_GROUPED` read per backend load; lazy lists never report per element. `clearStores` reports one delete for all its stores. Transactions report their lock key or stores, duration and whether they committed.
+
+Every outcome is `Completed`, `Failed` with the original error, or `Cancelled`; errors are rethrown unchanged. Anything the observer throws is discarded. Events contain names, kinds, counts, sizes and durations only: bound keys are reachable through the `StoreRelation` references, and row contents are never exposed. Without an observer no events, timings or statistics are created, and every operation takes the same transaction, cache and batching path either way.
+
 ## Schema and migrations
 
 Database schema version, serialized record format version, and remote resource revision are independent. Payload codecs and domain migrations belong to the application.
