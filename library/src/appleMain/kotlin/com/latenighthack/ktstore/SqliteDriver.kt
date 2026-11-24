@@ -8,6 +8,7 @@ import sqlite3.*
 import cnames.structs.sqlite3
 import cnames.structs.sqlite3_stmt
 import platform.Foundation.*
+import platform.posix.memcpy
 import kotlin.coroutines.*
 
 /** Absolute paths are app-owned. Relative paths retain the legacy Documents convention. */
@@ -109,7 +110,12 @@ class SqliteDriver(path: String, private val busyTimeoutMillis: Int = 5_000) : M
         override suspend fun step(): Boolean = access { live(); val result = sqlite3_step(statement); checkCode(result); result == SQLITE_ROW }
         override suspend fun getBytes(column: Int): ByteArray = access {
             live(); if (sqlite3_column_type(statement, column) == SQLITE_NULL) throw StoreFailure.CorruptRecord()
-            sqlite3_column_blob(statement, column)?.readBytes(sqlite3_column_bytes(statement, column)) ?: ByteArray(0)
+            // Blob first, then its size (SQLite's documented order). One memcpy: cinterop's readBytes
+            // copies byte by byte through boxed values, which dominated reads of large rows.
+            val source = sqlite3_column_blob(statement, column)
+            val size = sqlite3_column_bytes(statement, column)
+            if (source == null || size <= 0) ByteArray(0)
+            else ByteArray(size).also { bytes -> bytes.usePinned { memcpy(it.addressOf(0), source, size.convert()) } }
         }
         override suspend fun getLong(column: Int): Long = access { live(); sqlite3_column_int64(statement, column) }
         override suspend fun getText(column: Int): String = access { live(); sqlite3_column_text(statement, column)?.reinterpret<ByteVar>()?.toKString() ?: throw StoreFailure.CorruptRecord() }
